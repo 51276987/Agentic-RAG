@@ -208,7 +208,7 @@ Recommended but not required. `make docker-up` starts the API + PostgreSQL toget
 Today: **OpenAI only** via the `LLMRegistry` in `app/services/llm/registry.py`. Multi-provider support (Anthropic, Google, OpenRouter) via LangChain's `init_chat_model` is planned — see [#51](https://github.com/wassim249/fastapi-langgraph-agent-production-ready-template/issues/51). Configure your model via `DEFAULT_LLM_MODEL` in `.env.development`.
 
 **How do I configure long-term memory?**
-Long-term memory is self-hosted: mem0 runs in-process and persists into your existing PostgreSQL via pgvector — there is no separate mem0 cloud account or API key. You only need a working `OPENAI_API_KEY` (used for fact extraction + embeddings) and the pgvector extension enabled. See [docs/memory.md](docs/memory.md) for details.
+Long-term memory is self-hosted: mem0 runs in-process and persists into your existing PostgreSQL via pgvector — there is no separate mem0 cloud account or API key. Memory extraction uses the configured LLM, while embeddings can use either an OpenAI-compatible provider or local Ollama. See [docs/memory.md](docs/memory.md) for details.
 
 ### Development
 
@@ -230,8 +230,9 @@ Yes. Set `LANGFUSE_TRACING_ENABLED=false` (or omit the Langfuse keys). The agent
 
 **Memory / semantic search returns nothing**
 - Verify the `pgvector` extension is enabled in your PostgreSQL instance
-- Confirm `OPENAI_API_KEY` is valid (mem0 calls OpenAI for fact extraction + embeddings)
-- Check `LONG_TERM_MEMORY_MODEL` and `LONG_TERM_MEMORY_EMBEDDER_MODEL` are set in `.env.development`
+- Confirm the configured memory-extraction LLM is reachable
+- For local embeddings, confirm Ollama is reachable and the model is already available
+- Check the `LONG_TERM_MEMORY_EMBEDDER_*` variables and collection dimension in `.env.development`
 
 **Rate limiting is too aggressive**
 Limits are defined in `app/core/limiter.py` (slowapi). Adjust per-route decorators or the default rate in that file. See [docs/configuration.md](docs/configuration.md) for the related env vars.

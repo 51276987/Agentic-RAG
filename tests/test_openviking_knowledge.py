@@ -1,15 +1,13 @@
-"""Tests for the OpenViking knowledge base tool boundary."""
+"""Tests for the OpenViking knowledge base API boundary."""
 
 import asyncio
-import json
 from unittest.mock import AsyncMock
 
 import pytest
 
-from app.core.langgraph.tools.openviking_knowledge import (
-    OpenVikingKnowledgeClient,
+from app.services.openviking.api import (
+    OpenVikingKnowledgeAPI,
     _validate_resource_uri,
-    openviking_delete_resource,
 )
 
 
@@ -36,7 +34,7 @@ def test_destructive_operations_reject_resource_root() -> None:
 
 def test_find_forces_resource_context_type() -> None:
     """Semantic retrieval should never search memories or skills."""
-    client = OpenVikingKnowledgeClient()
+    client = OpenVikingKnowledgeAPI()
     request = AsyncMock(return_value={"resources": []})
     client._request = request  # pyright: ignore[reportPrivateUsage]
 
@@ -55,18 +53,9 @@ def test_find_forces_resource_context_type() -> None:
     )
 
 
-def test_delete_tool_requires_explicit_confirmation() -> None:
-    """The Agent must ask the user before deleting a knowledge resource."""
-    raw_result = asyncio.run(
-        openviking_delete_resource.ainvoke(
-            {
-                "uri": "viking://resources/docs/old.md",
-                "confirmed": False,
-                "recursive": False,
-            }
-        )
-    )
-    result = json.loads(raw_result)
+def test_delete_api_requires_explicit_confirmation() -> None:
+    """The API must reject deletion until its caller completes HITL."""
+    client = OpenVikingKnowledgeAPI()
 
-    assert result["ok"] is False
-    assert "ask_human" in result["error"]
+    with pytest.raises(ValueError, match="HITL"):
+        asyncio.run(client.delete("viking://resources/docs/old.md"))

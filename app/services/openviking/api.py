@@ -1,12 +1,10 @@
-"""OpenViking knowledge base tools for LangGraph.
+"""Asynchronous API client for OpenViking knowledge base operations.
 
-Only resource-oriented operations are exposed. OpenViking administration,
-sessions, memories, skills, snapshots, and system operations are intentionally
-outside this module's scope.
+The client is intended for dependency injection into LangGraph nodes. It is
+not registered as an LLM tool, so graph routing, authorization, retries, and
+retrieval limits remain deterministic.
 """
 
-import json
-from collections.abc import Awaitable
 from typing import (
     Any,
     Literal,
@@ -14,7 +12,6 @@ from typing import (
 from urllib.parse import urlsplit
 
 import httpx
-from langchain_core.tools import tool
 from tenacity import (
     retry,
     retry_if_exception,
@@ -23,7 +20,6 @@ from tenacity import (
 )
 
 from app.core.config import settings
-from app.core.logging import logger
 
 
 class OpenVikingAPIError(RuntimeError):
@@ -84,8 +80,8 @@ def _without_none(values: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in values.items() if value is not None}
 
 
-class OpenVikingKnowledgeClient:
-    """Small asynchronous client for OpenViking knowledge base APIs."""
+class OpenVikingKnowledgeAPI:
+    """Type-safe asynchronous API for OpenViking knowledge resources."""
 
     def __init__(self) -> None:
         """Initialize the client from application settings."""
@@ -132,6 +128,8 @@ class OpenVikingKnowledgeClient:
         request_timeout: float | None = None,
     ) -> Any:
         """Call OpenViking and unwrap its unified response envelope."""
+        if not settings.OPENVIKING_ENABLED:
+            raise RuntimeError("OpenViking API 未启用，请设置 OPENVIKING_ENABLED=true")
         if not self._base_url:
             raise ValueError("未配置 OPENVIKING_BASE_URL")
 
@@ -155,20 +153,33 @@ class OpenVikingKnowledgeClient:
             raise OpenVikingAPIError(502, "响应缺少 status=ok")
         return payload.get("result")
 
-    async def find(self, query: str, target_uri: str, limit: int) -> Any:
+    async def find(
+        self,
+        query: str,
+        target_uri: str = "viking://resources",
+        limit: int = 8,
+    ) -> Any:
         """Perform deterministic semantic retrieval over knowledge resources."""
+        normalized_query = query.strip()
+        if not normalized_query or len(normalized_query) > 2000:
+            raise ValueError("query 长度必须在 1 到 2000 个字符之间")
         return await self._request(
             "POST",
             "/api/v1/search/find",
             json_body={
-                "query": query,
+                "query": normalized_query,
                 "target_uri": _validate_resource_uri(target_uri),
                 "context_type": ["resource"],
                 "limit": _bounded_int(limit, name="limit", minimum=1, maximum=20),
             },
         )
 
-    async def list_resources(self, uri: str, recursive: bool, node_limit: int) -> Any:
+    async def list_resources(
+        self,
+        uri: str = "viking://resources",
+        recursive: bool = False,
+        node_limit: int = 100,
+    ) -> Any:
         """List knowledge files and directories."""
         return await self._request(
             "GET",
@@ -181,7 +192,13 @@ class OpenVikingKnowledgeClient:
             },
         )
 
-    async def read(self, uri: str, level: str, offset: int, limit: int) -> Any:
+    async def read(
+        self,
+        uri: str,
+        level: Literal["abstract", "overview", "full"] = "full",
+        offset: int = 0,
+        limit: int = 200,
+    ) -> Any:
         """Read L0, L1, or L2 knowledge content."""
         resource_uri = _validate_resource_uri(uri)
         if level == "abstract":
@@ -203,12 +220,12 @@ class OpenVikingKnowledgeClient:
     async def add_url(
         self,
         source_url: str,
-        to_uri: str | None,
-        reason: str | None,
-        wait: bool,
-        timeout_seconds: float,
-        crawl_depth: int,
-        max_pages: int,
+        to_uri: str | None = None,
+        reason: str | None = None,
+        wait: bool = False,
+        timeout_seconds: float = 180,
+        crawl_depth: int = 0,
+        max_pages: int = 10,
     ) -> Any:
         """Import a URL into the knowledge base."""
         timeout = max(1.0, min(timeout_seconds, 600.0))
@@ -236,9 +253,9 @@ class OpenVikingKnowledgeClient:
         self,
         uri: str,
         content: str,
-        mode: str,
-        wait: bool,
-        timeout_seconds: float,
+        mode: Literal["create", "replace", "append"] = "create",
+        wait: bool = False,
+        timeout_seconds: float = 180,
     ) -> Any:
         """Create, replace, or append a textual knowledge resource."""
         if mode not in {"create", "replace", "append"}:
@@ -277,8 +294,16 @@ class OpenVikingKnowledgeClient:
             raise ValueError("task_id 格式无效")
         return await self._request("GET", f"/api/v1/tasks/{value}")
 
-    async def delete(self, uri: str, recursive: bool) -> Any:
+    async def delete(
+        self,
+        uri: str,
+        *,
+        confirmed: bool = False,
+        recursive: bool = False,
+    ) -> Any:
         """Delete a knowledge resource after caller-side confirmation."""
+        if not confirmed:
+            raise ValueError("删除知识资源前必须由调用方完成权限校验和 HITL 确认")
         return await self._request(
             "DELETE",
             "/api/v1/fs",
@@ -289,175 +314,4 @@ class OpenVikingKnowledgeClient:
         )
 
 
-openviking_knowledge_client = OpenVikingKnowledgeClient()
-
-
-def _serialize_tool_result(operation: str, result: Any) -> str:
-    """Serialize and bound a tool result before returning it to the LLM."""
-    payload = {"ok": True, "operation": operation, "result": result}
-    serialized = json.dumps(payload, ensure_ascii=False, default=str)
-    max_chars = settings.OPENVIKING_TOOL_MAX_OUTPUT_CHARS
-    if len(serialized) <= max_chars:
-        return serialized
-    return json.dumps(
-        {
-            "ok": True,
-            "operation": operation,
-            "truncated": True,
-            "result_preview": serialized[:max_chars],
-        },
-        ensure_ascii=False,
-    )
-
-
-async def _execute_tool(operation: str, request: Awaitable[Any]) -> str:
-    """Execute an OpenViking request and return a model-readable result."""
-    try:
-        return _serialize_tool_result(operation, await request)
-    except Exception as exc:
-        logger.warning(
-            "openviking_tool_failed",
-            operation=operation,
-            error_type=type(exc).__name__,
-            error=str(exc),
-        )
-        return json.dumps(
-            {
-                "ok": False,
-                "operation": operation,
-                "error": str(exc),
-            },
-            ensure_ascii=False,
-        )
-
-
-@tool
-async def openviking_find(
-    query: str,
-    target_uri: str = "viking://resources",
-    limit: int = 8,
-) -> str:
-    """在 OpenViking 知识库中进行语义检索，只搜索 resource，不搜索 memory 或 skill."""
-    normalized_query = query.strip()
-    if not normalized_query or len(normalized_query) > 2000:
-        return json.dumps({"ok": False, "error": "query 长度必须在 1 到 2000 个字符之间"}, ensure_ascii=False)
-    return await _execute_tool(
-        "find",
-        openviking_knowledge_client.find(normalized_query, target_uri, limit),
-    )
-
-
-@tool
-async def openviking_list_resources(
-    uri: str = "viking://resources",
-    recursive: bool = False,
-    node_limit: int = 100,
-) -> str:
-    """列出 OpenViking 知识库目录；需要浏览知识库结构或定位文件 URI 时使用."""
-    return await _execute_tool(
-        "list_resources",
-        openviking_knowledge_client.list_resources(uri, recursive, node_limit),
-    )
-
-
-@tool
-async def openviking_read_resource(
-    uri: str,
-    level: Literal["abstract", "overview", "full"] = "full",
-    offset: int = 0,
-    limit: int = 200,
-) -> str:
-    """读取知识内容：abstract=L0 摘要，overview=L1 目录概览，full=L2 文件正文."""
-    return await _execute_tool(
-        "read_resource",
-        openviking_knowledge_client.read(uri, level, offset, limit),
-    )
-
-
-@tool
-async def openviking_add_url_resource(
-    source_url: str,
-    to_uri: str = "",
-    reason: str = "",
-    wait: bool = False,
-    timeout_seconds: float = 180,
-    crawl_depth: int = 0,
-    max_pages: int = 10,
-) -> str:
-    """把 HTTP(S) 文档、网页或 Git 仓库 URL 导入 OpenViking 知识库."""
-    return await _execute_tool(
-        "add_url_resource",
-        openviking_knowledge_client.add_url(
-            source_url=source_url,
-            to_uri=to_uri or None,
-            reason=reason or None,
-            wait=wait,
-            timeout_seconds=timeout_seconds,
-            crawl_depth=crawl_depth,
-            max_pages=max_pages,
-        ),
-    )
-
-
-@tool
-async def openviking_write_resource(
-    uri: str,
-    content: str,
-    mode: Literal["create", "replace", "append"] = "create",
-    wait: bool = False,
-    timeout_seconds: float = 180,
-) -> str:
-    """创建或更新 OpenViking 文本知识；仅支持资源文件 URI，不用于 memory、skill 或 session."""
-    return await _execute_tool(
-        "write_resource",
-        openviking_knowledge_client.write(uri, content, mode, wait, timeout_seconds),
-    )
-
-
-@tool
-async def openviking_resource_status(uri: str) -> str:
-    """查看 OpenViking 知识文件或目录的状态、大小、类型和锁状态."""
-    return await _execute_tool("resource_status", openviking_knowledge_client.stat(uri))
-
-
-@tool
-async def openviking_import_task_status(task_id: str) -> str:
-    """查询异步知识导入返回的 task_id 当前处理状态."""
-    return await _execute_tool(
-        "import_task_status",
-        openviking_knowledge_client.task_status(task_id),
-    )
-
-
-@tool
-async def openviking_delete_resource(
-    uri: str,
-    confirmed: bool = False,
-    recursive: bool = False,
-) -> str:
-    """删除知识资源；调用前必须先用 ask_human 获得用户确认，并将 confirmed 设为 true."""
-    if not confirmed:
-        return json.dumps(
-            {
-                "ok": False,
-                "operation": "delete_resource",
-                "error": "删除前必须调用 ask_human 获得用户明确确认",
-            },
-            ensure_ascii=False,
-        )
-    return await _execute_tool(
-        "delete_resource",
-        openviking_knowledge_client.delete(uri, recursive),
-    )
-
-
-openviking_knowledge_tools = [
-    openviking_find,
-    openviking_list_resources,
-    openviking_read_resource,
-    openviking_add_url_resource,
-    openviking_write_resource,
-    openviking_resource_status,
-    openviking_import_task_status,
-    openviking_delete_resource,
-]
+openviking_knowledge_api = OpenVikingKnowledgeAPI()

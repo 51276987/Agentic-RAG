@@ -158,10 +158,13 @@ class Settings:
 
         # Long term memory Configuration
         self.LONG_TERM_MEMORY_MODEL = os.getenv("LONG_TERM_MEMORY_MODEL", "gpt-5-nano")
+        self.LONG_TERM_MEMORY_EMBEDDER_PROVIDER = os.getenv("LONG_TERM_MEMORY_EMBEDDER_PROVIDER", "openai").lower()
         self.LONG_TERM_MEMORY_EMBEDDER_MODEL = os.getenv("LONG_TERM_MEMORY_EMBEDDER_MODEL", "text-embedding-3-small")
+        self.LONG_TERM_MEMORY_EMBEDDER_BASE_URL = os.getenv("LONG_TERM_MEMORY_EMBEDDER_BASE_URL", "")
+        self.LONG_TERM_MEMORY_EMBEDDER_DIMS = int(os.getenv("LONG_TERM_MEMORY_EMBEDDER_DIMS", "1536"))
         self.LONG_TERM_MEMORY_COLLECTION_NAME = os.getenv("LONG_TERM_MEMORY_COLLECTION_NAME", "longterm_memory")
 
-        # OpenViking knowledge base tool configuration
+        # OpenViking internal API configuration
         self.OPENVIKING_ENABLED = os.getenv("OPENVIKING_ENABLED", "false").lower() in ("true", "1", "t", "yes")
         self.OPENVIKING_BASE_URL = os.getenv("OPENVIKING_BASE_URL", "")
         self.OPENVIKING_API_KEY = os.getenv("OPENVIKING_API_KEY", "")
@@ -169,7 +172,6 @@ class Settings:
         self.OPENVIKING_ACCOUNT = os.getenv("OPENVIKING_ACCOUNT", "")
         self.OPENVIKING_USER = os.getenv("OPENVIKING_USER", "")
         self.OPENVIKING_TIMEOUT_SECONDS = float(os.getenv("OPENVIKING_TIMEOUT_SECONDS", "30"))
-        self.OPENVIKING_TOOL_MAX_OUTPUT_CHARS = int(os.getenv("OPENVIKING_TOOL_MAX_OUTPUT_CHARS", "20000"))
 
         # JWT Configuration
         self.JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "")

@@ -1,5 +1,7 @@
 """Long-term memory service using mem0 and pgvector with optional cache layer."""
 
+from typing import Any
+
 from mem0 import AsyncMemory
 
 from app.core.cache import (
@@ -16,6 +18,26 @@ class MemoryService:
     def __init__(self):
         """Initialize the memory service."""
         self._memory: AsyncMemory | None = None
+
+    def _build_embedder_config(self) -> dict[str, Any]:
+        """Build a mem0 embedder config for OpenAI-compatible or Ollama models."""
+        provider = settings.LONG_TERM_MEMORY_EMBEDDER_PROVIDER
+        if provider not in {"openai", "ollama"}:
+            raise ValueError("LONG_TERM_MEMORY_EMBEDDER_PROVIDER 仅支持 openai 或 ollama")
+
+        config: dict[str, Any] = {
+            "model": settings.LONG_TERM_MEMORY_EMBEDDER_MODEL,
+            "embedding_dims": settings.LONG_TERM_MEMORY_EMBEDDER_DIMS,
+        }
+        base_url = settings.LONG_TERM_MEMORY_EMBEDDER_BASE_URL.rstrip("/")
+        if provider == "ollama":
+            if not base_url:
+                raise ValueError("Ollama embedder 需要配置 LONG_TERM_MEMORY_EMBEDDER_BASE_URL")
+            config["ollama_base_url"] = base_url
+        elif base_url:
+            config["openai_base_url"] = base_url
+
+        return {"provider": provider, "config": config}
 
     async def _get_memory(self) -> AsyncMemory:
         if self._memory is None:
@@ -36,10 +58,7 @@ class MemoryService:
                         "provider": "openai",
                         "config": {"model": settings.LONG_TERM_MEMORY_MODEL},
                     },
-                    "embedder": {
-                        "provider": "openai",
-                        "config": {"model": settings.LONG_TERM_MEMORY_EMBEDDER_MODEL},
-                    },
+                    "embedder": self._build_embedder_config(),
                 }
             )
         return self._memory
@@ -51,7 +70,13 @@ class MemoryService:
         ~130ms from_config + pgvector.list_cols() cold-init cost.
         """
         await self._get_memory()
-        logger.info("memory_service_initialized")
+        logger.info(
+            "memory_service_initialized",
+            embedder_provider=settings.LONG_TERM_MEMORY_EMBEDDER_PROVIDER,
+            embedder_model=settings.LONG_TERM_MEMORY_EMBEDDER_MODEL,
+            embedding_dims=settings.LONG_TERM_MEMORY_EMBEDDER_DIMS,
+            collection_name=settings.LONG_TERM_MEMORY_COLLECTION_NAME,
+        )
 
     async def search(self, user_id: str | None, query: str) -> str:
         """Search relevant memories for a user.

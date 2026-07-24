@@ -7,12 +7,7 @@ and other external integrations.
 
 from langchain_core.tools.base import BaseTool
 
-from app.core.config import settings
-
 from .ask_human import ask_human
 from .duckduckgo_search import duckduckgo_search_tool
-from .openviking_knowledge import openviking_knowledge_tools
 
 tools: list[BaseTool] = [duckduckgo_search_tool, ask_human]
-if settings.OPENVIKING_ENABLED:
-    tools.extend(openviking_knowledge_tools)

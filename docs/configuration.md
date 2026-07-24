@@ -43,7 +43,10 @@ cp .env.example .env.development
 | --- | --- | --- |
 | `LONG_TERM_MEMORY_COLLECTION_NAME` | `longterm_memory` | pgvector collection name |
 | `LONG_TERM_MEMORY_MODEL` | `gpt-5-nano` | LLM used by mem0 to extract memories |
+| `LONG_TERM_MEMORY_EMBEDDER_PROVIDER` | `openai` | Embedding provider: `openai` or `ollama` |
 | `LONG_TERM_MEMORY_EMBEDDER_MODEL` | `text-embedding-3-small` | Embedding model for semantic search |
+| `LONG_TERM_MEMORY_EMBEDDER_BASE_URL` | — | Embedding endpoint; Docker uses `http://host.docker.internal:11434` for host Ollama |
+| `LONG_TERM_MEMORY_EMBEDDER_DIMS` | `1536` | Embedding vector dimension; must match the model and pgvector collection |
 
 ---
 
@@ -69,14 +72,13 @@ snapshot APIs are intentionally not exposed as Agent tools.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `OPENVIKING_ENABLED` | `false` | Register OpenViking knowledge base tools with the Agent |
+| `OPENVIKING_ENABLED` | `false` | Enable the internal OpenViking API client used by deterministic LangGraph nodes |
 | `OPENVIKING_BASE_URL` | — | OpenViking server URL; use `http://host.docker.internal:1933` when the Agent container connects to a server on the host |
 | `OPENVIKING_AUTH_MODE` | `api_key` | `api_key`, `trusted`, or `dev` |
 | `OPENVIKING_API_KEY` | — | OpenViking USER/ADMIN key for tenant data APIs; never hardcode it in source |
 | `OPENVIKING_ACCOUNT` | — | Trusted-mode account header value |
 | `OPENVIKING_USER` | — | Trusted-mode user header value |
 | `OPENVIKING_TIMEOUT_SECONDS` | `30` | HTTP request timeout |
-| `OPENVIKING_TOOL_MAX_OUTPUT_CHARS` | `20000` | Maximum serialized tool response size |
 
 In OpenViking `api_key` mode, use a tenant-bound USER or ADMIN key for knowledge data APIs. A ROOT
 key is not a tenant identity and should not be used for these tools.

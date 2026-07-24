@@ -58,8 +58,30 @@ After the LLM produces a response, memories are updated **in the background** vi
 | --- | --- | --- |
 | `LONG_TERM_MEMORY_COLLECTION_NAME` | `longterm_memory` | pgvector collection name |
 | `LONG_TERM_MEMORY_MODEL` | `gpt-5-nano` | LLM used by mem0 to extract and process memories |
+| `LONG_TERM_MEMORY_EMBEDDER_PROVIDER` | `openai` | Embedding provider: `openai` or `ollama` |
 | `LONG_TERM_MEMORY_EMBEDDER_MODEL` | `text-embedding-3-small` | Embedding model for semantic search |
+| `LONG_TERM_MEMORY_EMBEDDER_BASE_URL` | — | Provider endpoint; use `http://host.docker.internal:11434` for host Ollama from Docker |
+| `LONG_TERM_MEMORY_EMBEDDER_DIMS` | `1536` | Exact vector dimension produced by the embedding model |
 | `CACHE_TTL_SECONDS` | `60` | Memory search cache TTL |
+
+Local Ollama example:
+
+```dotenv
+LONG_TERM_MEMORY_EMBEDDER_PROVIDER=ollama
+LONG_TERM_MEMORY_EMBEDDER_MODEL=nomic-embed-text:latest
+LONG_TERM_MEMORY_EMBEDDER_BASE_URL=http://host.docker.internal:11434
+LONG_TERM_MEMORY_EMBEDDER_DIMS=768
+LONG_TERM_MEMORY_COLLECTION_NAME=longterm_memory_nomic_768
+NO_PROXY=localhost,127.0.0.1,host.docker.internal
+```
+
+Changing embedding models or dimensions requires a new collection name or a
+full re-embedding migration. Reusing a collection created with a different
+dimension causes pgvector dimension errors.
+
+If the host uses a system HTTP proxy, include the Ollama host in `NO_PROXY`.
+Otherwise the Python Ollama client may send local requests through the proxy
+and receive `502 Bad Gateway`.
 
 ## Startup pre-warming
 
