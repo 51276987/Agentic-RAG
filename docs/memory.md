@@ -57,7 +57,7 @@ After the LLM produces a response, memories are updated **in the background** vi
 | Variable | Default | Description |
 | --- | --- | --- |
 | `LONG_TERM_MEMORY_COLLECTION_NAME` | `longterm_memory` | pgvector collection name |
-| `LONG_TERM_MEMORY_MODEL` | `gpt-5-nano` | LLM used by mem0 to extract and process memories |
+| `LONG_TERM_MEMORY_MODEL` | `DEFAULT_LLM_MODEL` | LLM used by mem0 to extract and process memories; it must be supported by the configured OpenAI-compatible endpoint |
 | `LONG_TERM_MEMORY_EMBEDDER_PROVIDER` | `openai` | Embedding provider: `openai` or `ollama` |
 | `LONG_TERM_MEMORY_EMBEDDER_MODEL` | `text-embedding-3-small` | Embedding model for semantic search |
 | `LONG_TERM_MEMORY_EMBEDDER_BASE_URL` | — | Provider endpoint; use `http://host.docker.internal:11434` for host Ollama from Docker |
@@ -67,6 +67,7 @@ After the LLM produces a response, memories are updated **in the background** vi
 Local Ollama example:
 
 ```dotenv
+LONG_TERM_MEMORY_MODEL=deepseek-v4-flash
 LONG_TERM_MEMORY_EMBEDDER_PROVIDER=ollama
 LONG_TERM_MEMORY_EMBEDDER_MODEL=nomic-embed-text:latest
 LONG_TERM_MEMORY_EMBEDDER_BASE_URL=http://host.docker.internal:11434

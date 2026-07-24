@@ -157,7 +157,7 @@ class Settings:
         self.LLM_TOTAL_TIMEOUT = int(os.getenv("LLM_TOTAL_TIMEOUT", "60"))
 
         # Long term memory Configuration
-        self.LONG_TERM_MEMORY_MODEL = os.getenv("LONG_TERM_MEMORY_MODEL", "gpt-5-nano")
+        self.LONG_TERM_MEMORY_MODEL = os.getenv("LONG_TERM_MEMORY_MODEL", self.DEFAULT_LLM_MODEL)
         self.LONG_TERM_MEMORY_EMBEDDER_PROVIDER = os.getenv("LONG_TERM_MEMORY_EMBEDDER_PROVIDER", "openai").lower()
         self.LONG_TERM_MEMORY_EMBEDDER_MODEL = os.getenv("LONG_TERM_MEMORY_EMBEDDER_MODEL", "text-embedding-3-small")
         self.LONG_TERM_MEMORY_EMBEDDER_BASE_URL = os.getenv("LONG_TERM_MEMORY_EMBEDDER_BASE_URL", "")
