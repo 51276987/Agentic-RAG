@@ -39,21 +39,26 @@ class MemoryService:
 
         return {"provider": provider, "config": config}
 
+    def _build_vector_store_config(self) -> dict[str, Any]:
+        """Build pgvector config with dimensions matching the active embedder."""
+        return {
+            "provider": "pgvector",
+            "config": {
+                "collection_name": settings.LONG_TERM_MEMORY_COLLECTION_NAME,
+                "embedding_model_dims": settings.LONG_TERM_MEMORY_EMBEDDER_DIMS,
+                "dbname": settings.POSTGRES_DB,
+                "user": settings.POSTGRES_USER,
+                "password": settings.POSTGRES_PASSWORD,
+                "host": settings.POSTGRES_HOST,
+                "port": settings.POSTGRES_PORT,
+            },
+        }
+
     async def _get_memory(self) -> AsyncMemory:
         if self._memory is None:
             self._memory = await AsyncMemory.from_config(
                 config_dict={
-                    "vector_store": {
-                        "provider": "pgvector",
-                        "config": {
-                            "collection_name": settings.LONG_TERM_MEMORY_COLLECTION_NAME,
-                            "dbname": settings.POSTGRES_DB,
-                            "user": settings.POSTGRES_USER,
-                            "password": settings.POSTGRES_PASSWORD,
-                            "host": settings.POSTGRES_HOST,
-                            "port": settings.POSTGRES_PORT,
-                        },
-                    },
+                    "vector_store": self._build_vector_store_config(),
                     "llm": {
                         "provider": "openai",
                         "config": {"model": settings.LONG_TERM_MEMORY_MODEL},

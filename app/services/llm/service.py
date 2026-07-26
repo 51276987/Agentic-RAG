@@ -15,6 +15,7 @@ from typing import (
 
 from langchain_core.language_models import LanguageModelInput
 from langchain_core.messages import BaseMessage
+from langchain_core.output_parsers.openai_tools import PydanticToolsParser
 from openai import (
     APIError,
     APITimeoutError,
@@ -114,9 +115,10 @@ class LLMService:
             messages: Conversation messages to send.
             model_name: Override the model. ``None`` uses the current default.
             response_format: Pydantic schema for structured output. When
-                provided the call chains ``.with_structured_output(schema)``
-                and returns a validated instance of that schema instead of a
-                raw ``BaseMessage``.
+                provided, the schema is exposed as a tool without forcing
+                ``tool_choice`` and its arguments are validated as that schema.
+                This remains compatible with thinking models that accept tools
+                but reject forced tool selection.
             **model_kwargs: Extra kwargs forwarded to ``LLMRegistry.get`` when
                 constructing a one-off model instance (e.g. ``temperature``,
                 ``max_tokens``, ``reasoning``).
@@ -256,7 +258,12 @@ class LLMService:
 
         def _override_target(idx: int) -> Any:
             base = LLMRegistry.get(LLMRegistry.LLMS[idx]["name"], **model_kwargs)
-            return base.with_structured_output(response_format) if response_format else base
+            return (
+                base.bind_tools([response_format])
+                | PydanticToolsParser(tools=[response_format], first_tool_only=True)
+                if response_format
+                else base
+            )
 
         def _default_target(_: int) -> Any:
             return self._llm

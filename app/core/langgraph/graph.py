@@ -1,6 +1,7 @@
 """This file contains the LangGraph Agent/workflow and interactions with the LLM."""
 
 import asyncio
+import json
 from typing import (
     AsyncGenerator,
     Optional,
@@ -11,24 +12,18 @@ from urllib.parse import quote_plus
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import (
     AIMessage,
-    AIMessageChunk,
     BaseMessage,
-    ToolMessage,
     convert_to_openai_messages,
 )
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.errors import GraphInterrupt
-from langgraph.graph import (
-    END,
-    StateGraph,
-)
+from langgraph.graph import StateGraph
 from langchain_core.runnables.config import RunnableConfig
 from langgraph.graph.state import (
     Command,
     CompiledStateGraph,
 )
 from langgraph.types import (
-    RetryPolicy,
     StateSnapshot,
 )
 from psycopg import (
@@ -45,25 +40,50 @@ from app.core.config import (
     Environment,
     settings,
 )
-from app.core.langgraph.tools import tools
+from app.core.langgraph.agent_loop import AgentLoop
 from app.core.logging import logger
-from app.core.metrics import llm_inference_duration_seconds
-from app.core.observability import langfuse_callback_handler
-from app.core.prompts import load_system_prompt
+from app.core.observability import get_langfuse_callback_handler
 from app.schemas import (
     GraphState,
     Message,
 )
 from app.services.llm import llm_service
 from app.services.memory import memory_service
+from app.services.openviking import openviking_knowledge_api
 from app.utils import (
     dump_messages,
     extract_text_content,
-    prepare_messages,
-    process_llm_response,
 )
 
 PostgresConnPool = AsyncConnectionPool[AsyncConnection[DictRow]]
+CHECKPOINT_NAMESPACE = "agentic-rag-v1"
+
+
+def _checkpoint_thread_id(session_id: str) -> str:
+    """Return a versioned internal thread ID for graph-state isolation."""
+    return f"{session_id}:{CHECKPOINT_NAMESPACE}"
+
+
+def _trace_metadata(
+    session_id: str,
+    user_id: Optional[str],
+    username: Optional[str],
+    mode: str,
+) -> dict[str, object]:
+    """Build metadata recognized by Langfuse's LangChain integration."""
+    metadata: dict[str, object] = {
+        "session_id": session_id,
+        "username": username,
+        "environment": settings.ENVIRONMENT.value,
+        "debug": settings.DEBUG,
+        "agent_loop_version": CHECKPOINT_NAMESPACE,
+        "langfuse_session_id": session_id,
+        "langfuse_tags": ["agentic-rag", settings.ENVIRONMENT.value, mode],
+    }
+    if user_id is not None:
+        metadata["user_id"] = user_id
+        metadata["langfuse_user_id"] = user_id
+    return metadata
 
 
 class LangGraphAgent:
@@ -75,10 +95,8 @@ class LangGraphAgent:
 
     def __init__(self):
         """Initialize the LangGraph Agent with necessary components."""
-        # Use the LLM service with tools bound
         self.llm_service = llm_service
-        self.llm_service.bind_tools(tools)
-        self.tools_by_name = {tool.name: tool for tool in tools}
+        self.agent_loop = AgentLoop(self.llm_service, openviking_knowledge_api)
         self._connection_pool: Optional[PostgresConnPool] = None
         self._graph: Optional[CompiledStateGraph] = None
         logger.info(
@@ -127,90 +145,6 @@ class LangGraphAgent:
                 raise e
         return self._connection_pool
 
-    async def _chat(self, state: GraphState, config: RunnableConfig) -> Command:
-        """Process the chat state and generate a response.
-
-        Args:
-            state (GraphState): The current state of the conversation.
-            config (RunnableConfig): The runnable configuration for this invocation.
-
-        Returns:
-            Command: Command object with updated state and next node to execute.
-        """
-        # Get the current LLM instance for metrics
-        current_llm = self.llm_service.get_llm()
-        model_name = (
-            current_llm.model_name
-            if current_llm and hasattr(current_llm, "model_name")
-            else settings.DEFAULT_LLM_MODEL
-        )
-
-        username = config.get("metadata", {}).get("username")
-        thread_id = config.get("configurable", {}).get("thread_id")
-        SYSTEM_PROMPT = load_system_prompt(username=username, long_term_memory=state.long_term_memory)
-
-        # Prepare messages with system prompt
-        messages = prepare_messages(state.messages, SYSTEM_PROMPT)
-
-        try:
-            # Use LLM service with automatic retries and circular fallback
-            with llm_inference_duration_seconds.labels(model=model_name).time():
-                response_message = await self.llm_service.call(dump_messages(messages))
-
-            # Process response to handle structured content blocks
-            response_message = process_llm_response(response_message)
-
-            logger.info(
-                "llm_response_generated",
-                session_id=thread_id,
-                model=model_name,
-                environment=settings.ENVIRONMENT.value,
-            )
-
-            # Determine next node based on whether there are tool calls
-            if isinstance(response_message, AIMessage) and response_message.tool_calls:
-                goto = "tool_call"
-            else:
-                goto = END
-
-            return Command(update={"messages": [response_message]}, goto=goto)
-        except Exception as e:
-            logger.error(
-                "llm_call_failed_all_models",
-                session_id=thread_id,
-                error=str(e),
-                environment=settings.ENVIRONMENT.value,
-            )
-            raise Exception(f"failed to get llm response after trying all models: {str(e)}")
-
-    # Define our tool node
-    async def _tool_call(self, state: GraphState) -> Command:
-        """Process tool calls from the last message.
-
-        Args:
-            state: The current agent state containing messages and tool calls.
-
-        Returns:
-            Command: Command object with updated messages and routing back to chat.
-        """
-        tool_calls = state.messages[-1].tool_calls
-
-        async def _execute_tool(tool_call: dict) -> ToolMessage:
-            tool_result = await self.tools_by_name[tool_call["name"]].ainvoke(tool_call["args"])
-            return ToolMessage(
-                content=tool_result,
-                name=tool_call["name"],
-                tool_call_id=tool_call["id"],
-            )
-
-        # Execute tool calls concurrently when multiple are requested
-        if len(tool_calls) == 1:
-            outputs = [await _execute_tool(tool_calls[0])]
-        else:
-            outputs = list(await asyncio.gather(*[_execute_tool(tc) for tc in tool_calls]))
-
-        return Command(update={"messages": outputs}, goto="chat")
-
     async def create_graph(self) -> Optional[CompiledStateGraph]:
         """Create and configure the LangGraph workflow.
 
@@ -220,15 +154,7 @@ class LangGraphAgent:
         if self._graph is None:
             try:
                 graph_builder = StateGraph(GraphState)
-                graph_builder.add_node("chat", self._chat, destinations=("tool_call", END))
-                graph_builder.add_node(
-                    "tool_call",
-                    self._tool_call,
-                    destinations=("chat",),
-                    retry_policy=RetryPolicy(max_attempts=3),
-                )
-                graph_builder.set_entry_point("chat")
-                graph_builder.set_finish_point("chat")
+                self.agent_loop.configure(graph_builder)
 
                 # Get connection pool (may be None in production if DB unavailable)
                 connection_pool = await self._get_connection_pool()
@@ -294,17 +220,15 @@ class LangGraphAgent:
             list[Message]: The response from the LLM.
         """
         graph = await self._get_graph()
-        callbacks: list[BaseCallbackHandler] = [langfuse_callback_handler] if settings.LANGFUSE_TRACING_ENABLED else []
+        langfuse_handler = get_langfuse_callback_handler()
+        callbacks: list[BaseCallbackHandler] = [langfuse_handler] if langfuse_handler is not None else []
         config: RunnableConfig = {
-            "configurable": {"thread_id": session_id},
-            "callbacks": callbacks,
-            "metadata": {
-                "user_id": user_id,
-                "username": username,
-                "session_id": session_id,
-                "environment": settings.ENVIRONMENT.value,
-                "debug": settings.DEBUG,
+            "configurable": {
+                "thread_id": _checkpoint_thread_id(session_id),
             },
+            "callbacks": callbacks,
+            "metadata": _trace_metadata(session_id, user_id, username, "chat"),
+            "run_name": "agentic-rag-chat",
         }
 
         try:
@@ -332,7 +256,7 @@ class LangGraphAgent:
             if state.next:
                 interrupt_value = state.tasks[0].interrupts[0].value if state.tasks else "Waiting for input."
                 logger.info("graph_interrupted", session_id=session_id, interrupt_value=str(interrupt_value))
-                return [Message(role="assistant", content=str(interrupt_value))]
+                return [Message(role="assistant", content=self._format_interrupt(interrupt_value))]
 
             openai_msgs = cast(list[dict], convert_to_openai_messages(response["messages"]))
             asyncio.create_task(memory_service.add(user_id, openai_msgs, config.get("metadata")))
@@ -341,7 +265,7 @@ class LangGraphAgent:
             state = await graph.aget_state(config)
             interrupt_value = state.tasks[0].interrupts[0].value if state.tasks else "Waiting for input."
             logger.info("graph_interrupted", session_id=session_id, interrupt_value=str(interrupt_value))
-            return [Message(role="assistant", content=str(interrupt_value))]
+            return [Message(role="assistant", content=self._format_interrupt(interrupt_value))]
         except Exception as e:
             logger.exception("get_response_failed", error=str(e), session_id=session_id)
             raise
@@ -364,17 +288,15 @@ class LangGraphAgent:
         Yields:
             str: Tokens of the LLM response.
         """
-        callbacks: list[BaseCallbackHandler] = [langfuse_callback_handler] if settings.LANGFUSE_TRACING_ENABLED else []
+        langfuse_handler = get_langfuse_callback_handler()
+        callbacks: list[BaseCallbackHandler] = [langfuse_handler] if langfuse_handler is not None else []
         config: RunnableConfig = {
-            "configurable": {"thread_id": session_id},
-            "callbacks": callbacks,
-            "metadata": {
-                "user_id": user_id,
-                "username": username,
-                "session_id": session_id,
-                "environment": settings.ENVIRONMENT.value,
-                "debug": settings.DEBUG,
+            "configurable": {
+                "thread_id": _checkpoint_thread_id(session_id),
             },
+            "callbacks": callbacks,
+            "metadata": _trace_metadata(session_id, user_id, username, "stream"),
+            "run_name": "agentic-rag-chat-stream",
         }
         graph = await self._get_graph()
 
@@ -392,24 +314,29 @@ class LangGraphAgent:
                 relevant_memory = relevant_memory or "No relevant memory found."
                 graph_input = {"messages": dump_messages(messages), "long_term_memory": relevant_memory}
 
-            async for token, _ in graph.astream(
+            async for update in graph.astream(
                 graph_input,
                 config,
-                stream_mode="messages",
+                stream_mode="updates",
             ):
-                if not isinstance(token, (AIMessage, AIMessageChunk)):
+                if not isinstance(update, dict):
                     continue
-
-                text = extract_text_content(token.content)
-                if text:
-                    yield text
+                for node_name in ("finalizer", "direct_answer", "insufficient_evidence"):
+                    node_update = update.get(node_name)
+                    if not isinstance(node_update, dict):
+                        continue
+                    for message in node_update.get("messages", []):
+                        if isinstance(message, AIMessage):
+                            text = extract_text_content(message.content)
+                            if text:
+                                yield text
 
             # After streaming completes, check for interrupt or update memory
             state = await graph.aget_state(config)
             if state.next:
                 interrupt_value = state.tasks[0].interrupts[0].value if state.tasks else "Waiting for input."
                 logger.info("graph_interrupted_stream", session_id=session_id, interrupt_value=str(interrupt_value))
-                yield str(interrupt_value)
+                yield self._format_interrupt(interrupt_value)
             elif state.values and "messages" in state.values:
                 openai_msgs = cast(list[dict], convert_to_openai_messages(state.values["messages"]))
                 asyncio.create_task(memory_service.add(user_id, openai_msgs, config.get("metadata")))
@@ -417,7 +344,7 @@ class LangGraphAgent:
             state = await graph.aget_state(config)
             interrupt_value = state.tasks[0].interrupts[0].value if state.tasks else "Waiting for input."
             logger.info("graph_interrupted_stream", session_id=session_id, interrupt_value=str(interrupt_value))
-            yield str(interrupt_value)
+            yield self._format_interrupt(interrupt_value)
         except Exception as stream_error:
             logger.exception("stream_processing_failed", error=str(stream_error), session_id=session_id)
             raise stream_error
@@ -433,7 +360,11 @@ class LangGraphAgent:
         """
         graph = await self._get_graph()
 
-        config: RunnableConfig = {"configurable": {"thread_id": session_id}}
+        config: RunnableConfig = {
+            "configurable": {
+                "thread_id": _checkpoint_thread_id(session_id),
+            }
+        }
         state: StateSnapshot = await graph.aget_state(config=config)
         return self.__process_messages(state.values["messages"]) if state.values else []
 
@@ -445,6 +376,13 @@ class LangGraphAgent:
             for message in openai_style_messages
             if message["role"] in ["assistant", "user"] and message["content"]
         ]
+
+    @staticmethod
+    def _format_interrupt(value: object) -> str:
+        """Serialize structured HITL payloads as valid JSON."""
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False, default=str)
+        return str(value)
 
     async def clear_chat_history(self, session_id: str) -> None:
         """Clear all chat history for a given thread ID.
@@ -465,10 +403,11 @@ class LangGraphAgent:
             async with conn_pool.connection() as conn:
                 async with conn.pipeline():
                     for table in settings.CHECKPOINT_TABLES:
-                        await conn.execute(
-                            sql.SQL("DELETE FROM {} WHERE thread_id = %s").format(sql.Identifier(table)),
-                            (session_id,),
-                        )
+                        for checkpoint_thread_id in (session_id, _checkpoint_thread_id(session_id)):
+                            await conn.execute(
+                                sql.SQL("DELETE FROM {} WHERE thread_id = %s").format(sql.Identifier(table)),
+                                (checkpoint_thread_id,),
+                            )
                 logger.info(
                     "checkpoint_tables_cleared_for_session",
                     tables=settings.CHECKPOINT_TABLES,

@@ -32,3 +32,12 @@ def test_ollama_embedder_requires_base_url(monkeypatch: pytest.MonkeyPatch) -> N
 
     with pytest.raises(ValueError, match="LONG_TERM_MEMORY_EMBEDDER_BASE_URL"):
         MemoryService()._build_embedder_config()  # pyright: ignore[reportPrivateUsage]
+
+
+def test_pgvector_dimensions_match_embedder(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pgvector and mem0 telemetry must share the embedder dimensions."""
+    monkeypatch.setattr(settings, "LONG_TERM_MEMORY_EMBEDDER_DIMS", 768)
+
+    config = MemoryService()._build_vector_store_config()  # pyright: ignore[reportPrivateUsage]
+
+    assert config["config"]["embedding_model_dims"] == 768
