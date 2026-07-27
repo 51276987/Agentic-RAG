@@ -15,7 +15,9 @@ from typing import (
 
 from langchain_core.language_models import LanguageModelInput
 from langchain_core.messages import BaseMessage
+from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.output_parsers.openai_tools import PydanticToolsParser
+from langchain_core.runnables import RunnableLambda
 from openai import (
     APIError,
     APITimeoutError,
@@ -36,6 +38,29 @@ from app.core.logging import logger
 from app.services.llm.registry import LLMRegistry
 
 T = TypeVar("T", bound=BaseModel)
+
+
+class StructuredOutputError(RuntimeError):
+    """Indicate that an LLM response could not be parsed into the requested schema."""
+
+
+def _structured_output_runnable(base: Any, response_format: Type[BaseModel]) -> Any:
+    """Accept structured output from either a tool call or a JSON text response."""
+    tool_parser = PydanticToolsParser(tools=[response_format], first_tool_only=True)
+    text_parser = PydanticOutputParser(pydantic_object=response_format)
+
+    def parse_response(response: BaseMessage) -> BaseModel:
+        try:
+            tool_result = tool_parser.invoke(response)
+            if tool_result is not None:
+                return tool_result
+            return text_parser.invoke(response)
+        except Exception as exc:
+            raise StructuredOutputError(
+                f"failed to parse structured response as {response_format.__name__}: {exc}"
+            ) from exc
+
+    return base.bind_tools([response_format]) | RunnableLambda(parse_response)
 
 
 class LLMService:
@@ -173,7 +198,7 @@ class LLMService:
     @retry(
         stop=stop_after_attempt(settings.MAX_LLM_CALL_RETRIES),
         wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((RateLimitError, APITimeoutError, APIError)),
+        retry=retry_if_exception_type((RateLimitError, APITimeoutError, APIError, StructuredOutputError)),
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
     )
@@ -194,7 +219,7 @@ class LLMService:
             response = await llm.ainvoke(messages)
             logger.debug("llm_call_successful")
             return response
-        except (RateLimitError, APITimeoutError, APIError) as e:
+        except (RateLimitError, APITimeoutError, APIError, StructuredOutputError) as e:
             logger.warning(
                 "llm_call_failed_retrying",
                 error_type=type(e).__name__,
@@ -258,12 +283,7 @@ class LLMService:
 
         def _override_target(idx: int) -> Any:
             base = LLMRegistry.get(LLMRegistry.LLMS[idx]["name"], **model_kwargs)
-            return (
-                base.bind_tools([response_format])
-                | PydanticToolsParser(tools=[response_format], first_tool_only=True)
-                if response_format
-                else base
-            )
+            return _structured_output_runnable(base, response_format) if response_format else base
 
         def _default_target(_: int) -> Any:
             return self._llm
@@ -324,7 +344,7 @@ class LLMService:
             current_name = LLMRegistry.LLMS[current]["name"]
             try:
                 return await self._invoke_with_retry(get_target(current), messages)
-            except OpenAIError as e:
+            except (OpenAIError, StructuredOutputError) as e:
                 last_error = e
                 logger.error(
                     "llm_call_failed_after_retries",

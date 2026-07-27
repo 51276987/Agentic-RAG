@@ -2,6 +2,7 @@
 
 from app.schemas.auth import Token
 from app.schemas.agentic_rag import (
+    AnswerRequirement,
     EvidenceAssessment,
     GroundednessAssessment,
     IntentAnalysis,
@@ -21,6 +22,7 @@ from app.schemas.graph import GraphState
 
 __all__ = [
     "Token",
+    "AnswerRequirement",
     "IntentAnalysis",
     "RetrievalTask",
     "RetrievalPlan",

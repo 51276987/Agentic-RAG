@@ -24,6 +24,7 @@ from langgraph.types import interrupt
 from app.core.logging import logger
 from app.core.prompts.agentic_rag import get_agentic_rag_prompt
 from app.schemas import (
+    AnswerRequirement,
     EvidenceAssessment,
     GraphState,
     GroundednessAssessment,
@@ -133,6 +134,24 @@ def _iter_uri_items(value: Any) -> list[dict[str, Any]]:
     return items
 
 
+def _parse_answer_requirements(items: list[dict[str, Any] | str]) -> list[AnswerRequirement]:
+    """Normalize current requirements and legacy string-only checkpoints."""
+    requirements: list[AnswerRequirement] = []
+    for index, item in enumerate(items, start=1):
+        if isinstance(item, str):
+            requirements.append(
+                AnswerRequirement(
+                    requirement_id=f"req_{index}",
+                    description=item,
+                    priority="required",
+                    evidence_source="knowledge_base",
+                )
+            )
+            continue
+        requirements.append(AnswerRequirement.model_validate(item))
+    return requirements
+
+
 class AgentLoop:
     """Build and execute the bounded Agentic RAG workflow."""
 
@@ -236,8 +255,10 @@ class AgentLoop:
             "hydrated_evidence": [],
             "retrieval_errors": [],
             "selected_evidence": [],
-            "covered_requirements": [],
-            "missing_requirements": [],
+            "covered_required_ids": [],
+            "missing_required_ids": [],
+            "covered_optional_ids": [],
+            "missing_optional_ids": [],
             "draft_answer": "",
             "revision_instructions": "",
             "revision_count": 0,
@@ -288,7 +309,7 @@ class AgentLoop:
                 confidence = analysis.role_confidence
                 evidence = analysis.role_evidence
 
-        needs_role_clarification = role is None
+        needs_role_clarification = analysis.needs_retrieval and role is None
         logger.info(
             "agent_intent_analyzed",
             intent=analysis.intent,
@@ -306,8 +327,14 @@ class AgentLoop:
             "needs_role_clarification": needs_role_clarification,
             "entities": analysis.entities,
             "constraints": analysis.constraints,
-            "answer_requirements": analysis.answer_requirements,
-            "route": "role_clarification" if needs_role_clarification else "retrieval_planner",
+            "answer_requirements": [item.model_dump() for item in analysis.answer_requirements],
+            "route": (
+                "role_clarification"
+                if needs_role_clarification
+                else "retrieval_planner"
+                if analysis.needs_retrieval
+                else "direct_answer"
+            ),
         }
 
     async def role_clarification(self, state: GraphState) -> dict[str, Any]:
@@ -340,12 +367,16 @@ class AgentLoop:
 
     async def _create_plan(self, state: GraphState, *, repair: bool) -> list[RetrievalTask]:
         """Create and normalize a bounded retrieval plan."""
+        requirements = _parse_answer_requirements(state.answer_requirements)
+        missing_required_ids = set(state.missing_required_ids) if repair else set()
         payload = {
             "query": state.normalized_query,
             "intent": state.intent,
             "role": state.user_role,
-            "answer_requirements": state.answer_requirements,
-            "missing_requirements": state.missing_requirements if repair else [],
+            "answer_requirements": [item.model_dump() for item in requirements],
+            "missing_requirements": [
+                item.model_dump() for item in requirements if item.requirement_id in missing_required_ids
+            ],
             "allowed_target_uris": state.allowed_target_uris,
             "executed_queries": state.executed_queries,
             "retrieval_round": state.retrieval_round,
@@ -401,6 +432,8 @@ class AgentLoop:
     async def query_rewrite(self, state: GraphState) -> dict[str, Any]:
         """Rewrite all find tasks using the confirmed role."""
         tasks = [RetrievalTask.model_validate(task) for task in state.retrieval_tasks]
+        requirements = _parse_answer_requirements(state.answer_requirements)
+        missing_required_ids = set(state.missing_required_ids)
         find_tasks = [task for task in tasks if task.operation == "find"]
         if not find_tasks:
             return {"route": "retrieval_executor"}
@@ -415,7 +448,11 @@ class AgentLoop:
                             "role": state.user_role,
                             "tasks": [task.model_dump() for task in find_tasks],
                             "executed_queries": state.executed_queries,
-                            "missing_requirements": state.missing_requirements,
+                            "missing_requirements": [
+                                item.model_dump()
+                                for item in requirements
+                                if item.requirement_id in missing_required_ids
+                            ],
                         }
                     )
                 ),
@@ -616,14 +653,21 @@ class AgentLoop:
 
     async def evidence_grader(self, state: GraphState) -> dict[str, Any]:
         """Assess whether retrieved evidence covers every answer requirement."""
+        requirements = _parse_answer_requirements(state.answer_requirements)
+        required_ids = [item.requirement_id for item in requirements if item.priority == "required"]
+        optional_ids = [item.requirement_id for item in requirements if item.priority == "optional"]
         if not state.selected_evidence:
             return {
-                "covered_requirements": [],
-                "missing_requirements": state.answer_requirements,
+                "covered_required_ids": [],
+                "missing_required_ids": required_ids,
+                "covered_optional_ids": [],
+                "missing_optional_ids": optional_ids,
                 "route": (
                     "retrieval_repair"
-                    if state.retrieval_round < MAX_RETRIEVAL_ROUNDS
+                    if required_ids and state.retrieval_round < MAX_RETRIEVAL_ROUNDS
                     else "insufficient_evidence"
+                    if required_ids
+                    else "answer_generator"
                 ),
             }
 
@@ -634,7 +678,13 @@ class AgentLoop:
                     content=_json(
                         {
                             "query": state.normalized_query,
-                            "answer_requirements": state.answer_requirements,
+                            "user_context": {
+                                "role": state.user_role,
+                                "role_source": state.role_source,
+                                "role_confidence": state.role_confidence,
+                                "role_evidence": state.role_evidence,
+                            },
+                            "answer_requirements": [item.model_dump() for item in requirements],
                             "evidence": state.selected_evidence,
                         },
                         max_chars=MAX_EVIDENCE_CHARS,
@@ -643,15 +693,32 @@ class AgentLoop:
             ],
             response_format=EvidenceAssessment,
         )
-        if assessment.sufficient:
+        covered_required_id_set = set(assessment.covered_required_ids)
+        covered_optional_id_set = set(assessment.covered_optional_ids)
+        covered_required_ids = [item for item in required_ids if item in covered_required_id_set]
+        missing_required_ids = [item for item in required_ids if item not in covered_required_id_set]
+        covered_optional_ids = [item for item in optional_ids if item in covered_optional_id_set]
+        missing_optional_ids = [item for item in optional_ids if item not in covered_optional_id_set]
+        required_sufficient = not missing_required_ids
+        if assessment.required_sufficient != required_sufficient:
+            logger.warning(
+                "evidence_assessment_consistency_corrected",
+                model_required_sufficient=assessment.required_sufficient,
+                computed_required_sufficient=required_sufficient,
+                missing_required_ids=missing_required_ids,
+            )
+
+        if required_sufficient:
             route = "answer_generator"
         elif state.retrieval_round < MAX_RETRIEVAL_ROUNDS:
             route = "retrieval_repair"
         else:
             route = "insufficient_evidence"
         return {
-            "covered_requirements": assessment.covered_requirements,
-            "missing_requirements": assessment.missing_requirements,
+            "covered_required_ids": covered_required_ids,
+            "missing_required_ids": missing_required_ids,
+            "covered_optional_ids": covered_optional_ids,
+            "missing_optional_ids": missing_optional_ids,
             "route": route,
         }
 
@@ -668,6 +735,7 @@ class AgentLoop:
 
     async def answer_generator(self, state: GraphState) -> dict[str, Any]:
         """Generate or revise a cited answer using selected evidence only."""
+        requirements = _parse_answer_requirements(state.answer_requirements)
         response = await self.llm_service.call(
             [
                 SystemMessage(content=get_agentic_rag_prompt("answer_generator")),
@@ -676,7 +744,8 @@ class AgentLoop:
                         {
                             "query": state.normalized_query,
                             "role": state.user_role,
-                            "answer_requirements": state.answer_requirements,
+                            "answer_requirements": [item.model_dump() for item in requirements],
+                            "missing_optional_ids": state.missing_optional_ids,
                             "evidence": state.selected_evidence,
                             "revision_instructions": state.revision_instructions,
                         },
@@ -690,6 +759,9 @@ class AgentLoop:
 
     async def groundedness_verifier(self, state: GraphState) -> dict[str, Any]:
         """Verify support, coverage, and citation validity."""
+        requirements = _parse_answer_requirements(state.answer_requirements)
+        required_id_set = {item.requirement_id for item in requirements if item.priority == "required"}
+        optional_id_set = {item.requirement_id for item in requirements if item.priority == "optional"}
         available_uris = sorted({item["uri"] for item in state.selected_evidence if item.get("uri")})
         assessment = await self.llm_service.call(
             [
@@ -698,7 +770,11 @@ class AgentLoop:
                     content=_json(
                         {
                             "query": state.normalized_query,
-                            "answer_requirements": state.answer_requirements,
+                            "user_context": {
+                                "role": state.user_role,
+                                "role_source": state.role_source,
+                            },
+                            "answer_requirements": [item.model_dump() for item in requirements],
                             "draft_answer": state.draft_answer,
                             "available_uris": available_uris,
                             "evidence": state.selected_evidence,
@@ -711,12 +787,25 @@ class AgentLoop:
         )
 
         has_valid_citation = not available_uris or any(uri in state.draft_answer for uri in available_uris)
-        if assessment.passed and assessment.action == "pass" and has_valid_citation:
+        missing_required_ids = [
+            item for item in assessment.missing_required_ids if item in required_id_set
+        ]
+        missing_optional_ids = [
+            item for item in assessment.missing_optional_ids if item in optional_id_set
+        ]
+        has_required_gap = bool(missing_required_ids)
+        if assessment.passed and assessment.action == "pass" and has_valid_citation and not has_required_gap:
             route = "finalizer"
-        elif assessment.action == "retrieve" and state.retrieval_round < MAX_RETRIEVAL_ROUNDS:
+        elif (
+            has_required_gap
+            and assessment.action == "retrieve"
+            and state.retrieval_round < MAX_RETRIEVAL_ROUNDS
+        ):
             route = "retrieval_repair"
         elif state.revision_count < 1:
             route = "answer_generator"
+        elif not has_required_gap and not assessment.unsupported_claims:
+            route = "finalizer"
         else:
             route = "insufficient_evidence"
 
@@ -724,7 +813,8 @@ class AgentLoop:
         if not has_valid_citation:
             instructions = f"{instructions}\n为关键结论补充可用 URI 引用。".strip()
         return {
-            "missing_requirements": assessment.missing_requirements or state.missing_requirements,
+            "missing_required_ids": missing_required_ids or state.missing_required_ids,
+            "missing_optional_ids": missing_optional_ids or state.missing_optional_ids,
             "revision_instructions": instructions,
             "revision_count": state.revision_count + (1 if route == "answer_generator" else 0),
             "route": route,
@@ -740,7 +830,15 @@ class AgentLoop:
 
     async def insufficient_evidence(self, state: GraphState) -> dict[str, Any]:
         """Return an explicit no-guess response after bounded retries."""
-        missing = state.missing_requirements or state.answer_requirements
+        requirements = _parse_answer_requirements(state.answer_requirements)
+        missing_id_set = set(state.missing_required_ids)
+        missing = [
+            item.description
+            for item in requirements
+            if item.priority == "required" and item.requirement_id in missing_id_set
+        ]
+        if not missing:
+            missing = [item.description for item in requirements if item.priority == "required"]
         sources = sorted({item["uri"] for item in state.selected_evidence if item.get("uri")})
         parts = [
             "当前知识库证据不足，我不会继续推测。",

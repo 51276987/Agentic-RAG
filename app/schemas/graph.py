@@ -37,7 +37,7 @@ class GraphState(BaseModel):
     needs_retrieval: bool = True
     entities: list[str] = Field(default_factory=list)
     constraints: list[str] = Field(default_factory=list)
-    answer_requirements: list[str] = Field(default_factory=list)
+    answer_requirements: list[dict[str, Any] | str] = Field(default_factory=list)
     allowed_target_uris: list[str] = Field(default_factory=lambda: ["viking://resources"])
 
     retrieval_tasks: list[dict[str, Any]] = Field(default_factory=list)
@@ -51,8 +51,10 @@ class GraphState(BaseModel):
     hydrated_evidence: list[dict[str, Any]] = Field(default_factory=list)
     retrieval_errors: list[dict[str, Any]] = Field(default_factory=list)
     selected_evidence: list[dict[str, Any]] = Field(default_factory=list)
-    covered_requirements: list[str] = Field(default_factory=list)
-    missing_requirements: list[str] = Field(default_factory=list)
+    covered_required_ids: list[str] = Field(default_factory=list)
+    missing_required_ids: list[str] = Field(default_factory=list)
+    covered_optional_ids: list[str] = Field(default_factory=list)
+    missing_optional_ids: list[str] = Field(default_factory=list)
 
     draft_answer: str = ""
     revision_instructions: str = ""

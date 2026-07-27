@@ -7,12 +7,11 @@ from langchain_core.messages import (
     AIMessage,
     HumanMessage,
 )
-from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import StateGraph
-from langgraph.types import Command
 
 from app.core.langgraph.agent_loop import AgentLoop
 from app.schemas import (
+    AnswerRequirement,
     EvidenceAssessment,
     GraphState,
     GroundednessAssessment,
@@ -89,7 +88,14 @@ def test_agent_loop_runs_read_only_retrieval_to_verified_answer() -> None:
             IntentAnalysis(
                 intent="fact_lookup",
                 needs_retrieval=True,
-                answer_requirements=["列出知识库文件"],
+                answer_requirements=[
+                    AnswerRequirement(
+                        requirement_id="req_1",
+                        description="列出知识库文件",
+                        priority="required",
+                        evidence_source="knowledge_base",
+                    )
+                ],
             ),
             RetrievalPlan(
                 tasks=[
@@ -103,9 +109,11 @@ def test_agent_loop_runs_read_only_retrieval_to_verified_answer() -> None:
                 ]
             ),
             EvidenceAssessment(
-                sufficient=True,
-                covered_requirements=["列出知识库文件"],
-                missing_requirements=[],
+                required_sufficient=True,
+                covered_required_ids=["req_1"],
+                missing_required_ids=[],
+                covered_optional_ids=[],
+                missing_optional_ids=[],
                 reason="目录结果和摘要足够",
             ),
             AIMessage(content="知识库包含 guide.md。[来源: viking://resources/guide.md]"),
@@ -113,7 +121,8 @@ def test_agent_loop_runs_read_only_retrieval_to_verified_answer() -> None:
                 passed=True,
                 action="pass",
                 unsupported_claims=[],
-                missing_requirements=[],
+                missing_required_ids=[],
+                missing_optional_ids=[],
             ),
         ]
     )
@@ -139,43 +148,43 @@ def test_agent_loop_runs_read_only_retrieval_to_verified_answer() -> None:
     assert not llm.responses
 
 
-def test_agent_loop_interrupts_and_resumes_for_unknown_role() -> None:
-    """An unknown role should pause and resume the original request."""
+def test_agent_loop_answers_greeting_without_role_clarification() -> None:
+    """A conversational request should not ask for a role or retrieve knowledge."""
     llm = FakeLLMService(
         [
             IntentAnalysis(
                 intent="conversational",
                 needs_retrieval=False,
-                answer_requirements=["友好回应用户"],
+                answer_requirements=[
+                    AnswerRequirement(
+                        requirement_id="req_1",
+                        description="友好回应用户",
+                        priority="required",
+                        evidence_source="user_context",
+                    )
+                ],
             ),
             AIMessage(content="你好，很高兴为你服务。"),
         ]
     )
     api = FakeOpenVikingAPI()
-    graph = _build_graph(llm, api, checkpointer=InMemorySaver())
-    config = {"configurable": {"thread_id": "role-test:agentic-rag-v1"}}
+    graph = _build_graph(llm, api)
 
-    first_result = asyncio.run(
+    result = asyncio.run(
         graph.ainvoke(
             {
                 "messages": [HumanMessage(content="你好")],
                 "long_term_memory": "",
-            },
-            config=config,
+            }
         )
     )
-    state = asyncio.run(graph.aget_state(config))
 
-    assert "__interrupt__" in first_result
-    assert state.next == ("role_clarification",)
-
-    final_result = asyncio.run(graph.ainvoke(Command(resume="开发"), config=config))
-
-    assert final_result["user_role"] == "developer"
-    assert final_result["role_source"] == "hitl"
-    assert final_result["route"] == "completed"
-    assert final_result["final_answer"] == "你好，很高兴为你服务。"
+    assert result["user_role"] is None
+    assert result["needs_role_clarification"] is False
+    assert result["route"] == "completed"
+    assert result["final_answer"] == "你好，很高兴为你服务。"
     assert not api.calls
+    assert not llm.responses
 
 
 def test_agent_loop_repairs_missing_evidence_within_two_rounds() -> None:
@@ -185,7 +194,20 @@ def test_agent_loop_repairs_missing_evidence_within_two_rounds() -> None:
             IntentAnalysis(
                 intent="procedure",
                 needs_retrieval=True,
-                answer_requirements=["说明认证配置", "给出验证方法"],
+                answer_requirements=[
+                    AnswerRequirement(
+                        requirement_id="req_1",
+                        description="说明认证配置",
+                        priority="required",
+                        evidence_source="knowledge_base",
+                    ),
+                    AnswerRequirement(
+                        requirement_id="req_2",
+                        description="给出验证方法",
+                        priority="required",
+                        evidence_source="knowledge_base",
+                    ),
+                ],
             ),
             RetrievalPlan(
                 tasks=[
@@ -199,9 +221,11 @@ def test_agent_loop_repairs_missing_evidence_within_two_rounds() -> None:
             ),
             QueryRewriteResult(queries=[RewrittenQuery(task_id="r1", query="认证配置参数")]),
             EvidenceAssessment(
-                sufficient=False,
-                covered_requirements=["说明认证配置"],
-                missing_requirements=["给出验证方法"],
+                required_sufficient=False,
+                covered_required_ids=["req_1"],
+                missing_required_ids=["req_2"],
+                covered_optional_ids=[],
+                missing_optional_ids=[],
                 reason="缺少验证步骤",
             ),
             RetrievalPlan(
@@ -218,9 +242,11 @@ def test_agent_loop_repairs_missing_evidence_within_two_rounds() -> None:
                 queries=[RewrittenQuery(task_id="r2", query="认证配置验证命令和预期结果")]
             ),
             EvidenceAssessment(
-                sufficient=True,
-                covered_requirements=["说明认证配置", "给出验证方法"],
-                missing_requirements=[],
+                required_sufficient=True,
+                covered_required_ids=["req_1", "req_2"],
+                missing_required_ids=[],
+                covered_optional_ids=[],
+                missing_optional_ids=[],
                 reason="配置和验证证据完整",
             ),
             AIMessage(content="按照文档配置并执行验证命令。[来源: viking://resources/auth.md]"),
@@ -228,7 +254,8 @@ def test_agent_loop_repairs_missing_evidence_within_two_rounds() -> None:
                 passed=True,
                 action="pass",
                 unsupported_claims=[],
-                missing_requirements=[],
+                missing_required_ids=[],
+                missing_optional_ids=[],
             ),
         ]
     )
@@ -257,4 +284,80 @@ def test_agent_loop_repairs_missing_evidence_within_two_rounds() -> None:
         "viking://resources/auth.md",
         "viking://resources/validation.md",
     }
+    assert not llm.responses
+
+
+def test_optional_requirement_does_not_trigger_retrieval_repair() -> None:
+    """An uncovered optional personalization item must not cause another retrieval round."""
+    llm = FakeLLMService(
+        [
+            IntentAnalysis(
+                intent="fact_lookup",
+                needs_retrieval=True,
+                answer_requirements=[
+                    AnswerRequirement(
+                        requirement_id="req_1",
+                        description="列出知识库资源",
+                        priority="required",
+                        evidence_source="knowledge_base",
+                    ),
+                    AnswerRequirement(
+                        requirement_id="req_2",
+                        description="提供资源路径",
+                        priority="required",
+                        evidence_source="knowledge_base",
+                    ),
+                    AnswerRequirement(
+                        requirement_id="req_3",
+                        description="根据新员工角色推荐优先学习资源",
+                        priority="optional",
+                        evidence_source="knowledge_and_context",
+                    ),
+                ],
+            ),
+            RetrievalPlan(
+                tasks=[
+                    RetrievalTask(
+                        task_id="r1",
+                        purpose="列出资源及路径",
+                        operation="list_resources",
+                        information_need="知识库资源列表和路径",
+                        hydration_level="abstract",
+                    )
+                ]
+            ),
+            EvidenceAssessment(
+                required_sufficient=True,
+                covered_required_ids=["req_1", "req_2"],
+                missing_required_ids=[],
+                covered_optional_ids=[],
+                missing_optional_ids=["req_3"],
+                reason="必须项证据充分，可选推荐缺少依据",
+            ),
+            AIMessage(content="知识库包含 guide.md。[来源: viking://resources/guide.md]"),
+            GroundednessAssessment(
+                passed=True,
+                action="pass",
+                unsupported_claims=[],
+                missing_required_ids=[],
+                missing_optional_ids=["req_3"],
+            ),
+        ]
+    )
+    api = FakeOpenVikingAPI()
+    graph = _build_graph(llm, api)
+
+    result = asyncio.run(
+        graph.ainvoke(
+            {
+                "messages": [HumanMessage(content="我是新员工，知识库有哪些资源？")],
+                "long_term_memory": "",
+            }
+        )
+    )
+
+    assert result["retrieval_round"] == 1
+    assert result["missing_required_ids"] == []
+    assert result["missing_optional_ids"] == ["req_3"]
+    assert result["route"] == "completed"
     assert not llm.responses

@@ -33,6 +33,10 @@ LANGFUSE_SECRET_KEY=sk-...
 LANGFUSE_HOST=https://cloud.langfuse.com   # or your self-hosted URL
 ```
 
+使用 Langfuse Cloud 时，不需要在 `docker-compose.yml` 中增加 Langfuse
+服务。现有的 `app.env_file` 配置会把这些变量传入 API 容器；只有采用
+Langfuse 私有化部署时才需要额外的 Compose 服务。
+
 **Disable for local dev:**
 
 ```bash
