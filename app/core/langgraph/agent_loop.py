@@ -26,24 +26,24 @@ from app.core.prompts.agentic_rag import get_agentic_rag_prompt
 from app.schemas import (
     AnswerRequirement,
     EvidenceAssessment,
+    GrepKeywordResult,
     GraphState,
     GroundednessAssessment,
     IntentAnalysis,
     QueryRewriteResult,
-    RetrievalPlan,
     RetrievalTask,
+    SystemScopeResult,
 )
 from app.services.llm import LLMService
 from app.services.openviking import OpenVikingKnowledgeAPI
 from app.utils import extract_text_content
 
-MAX_RETRIEVAL_ROUNDS = 2
 MAX_PARALLEL_TASKS = 4
 MAX_RESULTS_PER_TASK = 10
-MAX_LISTED_RESOURCES = 100
 MAX_HYDRATED_RESOURCES = 8
 MAX_FULL_CONTENT_RESOURCES = 4
 MAX_EVIDENCE_CHARS = 24_000
+SourceLevel = Literal["abstract", "overview", "full"]
 
 _ROLE_LABELS = {
     "product_manager": "产品经理",
@@ -61,9 +61,6 @@ _ROLE_ALIASES = {
     "新入职员工": "new_employee",
     "新员工": "new_employee",
 }
-_DIRECTORY_TERMS = ("有哪些文件", "有什么文件", "目录", "文件列表", "知识库结构", "列出文件")
-
-
 def _json(value: Any, *, max_chars: int | None = None) -> str:
     """Serialize prompt data without leaking non-serializable objects."""
     text = json.dumps(value, ensure_ascii=False, default=str)
@@ -119,6 +116,16 @@ def _is_allowed_uri(uri: str, allowed_roots: list[str]) -> bool:
     return False
 
 
+def _normalize_system_name(value: str | None) -> str | None:
+    """Accept one literal root-folder name and reject path-like model output."""
+    name = (value or "").strip()
+    if not name or name in {".", ".."}:
+        return None
+    if any(separator in name for separator in ("/", "\\", ":")):
+        return None
+    return name
+
+
 def _iter_uri_items(value: Any) -> list[dict[str, Any]]:
     """Recursively collect OpenViking result objects containing a URI."""
     items: list[dict[str, Any]] = []
@@ -132,6 +139,74 @@ def _iter_uri_items(value: Any) -> list[dict[str, Any]]:
         for nested in value:
             items.extend(_iter_uri_items(nested))
     return items
+
+
+def _normalize_source_level(value: Any) -> SourceLevel | None:
+    """Normalize OpenViking find result levels to read API levels."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        numeric_levels: dict[int, SourceLevel] = {0: "abstract", 1: "overview", 2: "full"}
+        return numeric_levels.get(value)
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    text_levels: dict[str, SourceLevel] = {
+        "0": "abstract",
+        "l0": "abstract",
+        "abstract": "abstract",
+        "1": "overview",
+        "l1": "overview",
+        "overview": "overview",
+        "2": "full",
+        "l2": "full",
+        "full": "full",
+    }
+    return text_levels.get(normalized)
+
+
+def _numeric_score(item: dict[str, Any]) -> float | None:
+    """Return a real retrieval score without inventing one for list results."""
+    value = item.get("score", item.get("similarity"))
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _source_level_rank(level: str | None) -> int:
+    """Return the relative amount of content represented by a source level."""
+    return {None: -1, "abstract": 0, "overview": 1, "full": 2}[level]
+
+
+def _merge_candidates(current: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    """Merge duplicate URIs while retaining the strongest score and richest level."""
+    current_score = current.get("score")
+    candidate_score = candidate.get("score")
+    prefer_candidate = candidate_score is not None and (
+        current_score is None or candidate_score > current_score
+    )
+    merged = dict(candidate if prefer_candidate else current)
+    levels = [current.get("source_level"), candidate.get("source_level")]
+    merged["source_level"] = max(levels, key=_source_level_rank)
+    merged["is_directory"] = bool(current.get("is_directory") or candidate.get("is_directory"))
+    merged["task_ids"] = list(dict.fromkeys([*current["task_ids"], *candidate["task_ids"]]))
+    merged["operations"] = list(
+        dict.fromkeys([*current["operations"], *candidate["operations"]])
+    )
+    return merged
+
+
+def _select_fused_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Sort semantic hits by score and keep unscored grep matches in source order."""
+    return sorted(
+        candidates,
+        key=lambda item: (
+            item["score"] is None,
+            -(item["score"] or 0.0),
+            item["task_order"],
+            item["source_rank"],
+        ),
+    )[:MAX_HYDRATED_RESOURCES]
 
 
 def _parse_answer_requirements(items: list[dict[str, Any] | str]) -> list[AnswerRequirement]:
@@ -152,6 +227,23 @@ def _parse_answer_requirements(items: list[dict[str, Any] | str]) -> list[Answer
     return requirements
 
 
+def _next_retrieval_route(
+    retrieval_stage: str,
+    hitl_retry_used: bool,
+) -> Literal[
+    "query_rewrite",
+    "grep_query_builder",
+    "question_clarification",
+    "knowledge_not_found",
+]:
+    """Return the single allowed next step in the fixed retrieval fallback chain."""
+    if retrieval_stage == "initial_find":
+        return "query_rewrite"
+    if retrieval_stage == "rewritten_find":
+        return "grep_query_builder"
+    return "knowledge_not_found" if hitl_retry_used else "question_clarification"
+
+
 class AgentLoop:
     """Build and execute the bounded Agentic RAG workflow."""
 
@@ -165,17 +257,19 @@ class AgentLoop:
         graph.add_node("prepare_request", self.prepare_request)
         graph.add_node("intent_analyzer", self.intent_analyzer)
         graph.add_node("role_clarification", self.role_clarification)
-        graph.add_node("retrieval_planner", self.retrieval_planner)
+        graph.add_node("system_scope_determination", self.system_scope_determination)
+        graph.add_node("initial_find", self.initial_find)
         graph.add_node("query_rewrite", self.query_rewrite)
+        graph.add_node("grep_query_builder", self.grep_query_builder)
         graph.add_node("retrieval_executor", self.retrieval_executor)
         graph.add_node("result_fusion", self.result_fusion)
         graph.add_node("evidence_hydration", self.evidence_hydration)
         graph.add_node("evidence_grader", self.evidence_grader)
-        graph.add_node("retrieval_repair", self.retrieval_repair)
+        graph.add_node("question_clarification", self.question_clarification)
+        graph.add_node("knowledge_not_found", self.knowledge_not_found)
         graph.add_node("answer_generator", self.answer_generator)
         graph.add_node("groundedness_verifier", self.groundedness_verifier)
         graph.add_node("finalizer", self.finalizer)
-        graph.add_node("insufficient_evidence", self.insufficient_evidence)
         graph.add_node("direct_answer", self.direct_answer)
 
         graph.add_edge(START, "prepare_request")
@@ -185,7 +279,7 @@ class AgentLoop:
             self.route_after_intent,
             {
                 "role_clarification": "role_clarification",
-                "retrieval_planner": "retrieval_planner",
+                "system_scope_determination": "system_scope_determination",
                 "direct_answer": "direct_answer",
             },
         )
@@ -193,12 +287,14 @@ class AgentLoop:
             "role_clarification",
             self.route_after_role,
             {
-                "retrieval_planner": "retrieval_planner",
+                "system_scope_determination": "system_scope_determination",
                 "direct_answer": "direct_answer",
             },
         )
-        graph.add_edge("retrieval_planner", "query_rewrite")
+        graph.add_edge("system_scope_determination", "initial_find")
+        graph.add_edge("initial_find", "retrieval_executor")
         graph.add_edge("query_rewrite", "retrieval_executor")
+        graph.add_edge("grep_query_builder", "retrieval_executor")
         graph.add_edge("retrieval_executor", "result_fusion")
         graph.add_edge("result_fusion", "evidence_hydration")
         graph.add_edge("evidence_hydration", "evidence_grader")
@@ -207,11 +303,13 @@ class AgentLoop:
             self.route_after_evidence,
             {
                 "answer_generator": "answer_generator",
-                "retrieval_repair": "retrieval_repair",
-                "insufficient_evidence": "insufficient_evidence",
+                "query_rewrite": "query_rewrite",
+                "grep_query_builder": "grep_query_builder",
+                "question_clarification": "question_clarification",
+                "knowledge_not_found": "knowledge_not_found",
             },
         )
-        graph.add_edge("retrieval_repair", "query_rewrite")
+        graph.add_edge("question_clarification", "intent_analyzer")
         graph.add_edge("answer_generator", "groundedness_verifier")
         graph.add_conditional_edges(
             "groundedness_verifier",
@@ -219,13 +317,15 @@ class AgentLoop:
             {
                 "finalizer": "finalizer",
                 "answer_generator": "answer_generator",
-                "retrieval_repair": "retrieval_repair",
-                "insufficient_evidence": "insufficient_evidence",
+                "query_rewrite": "query_rewrite",
+                "grep_query_builder": "grep_query_builder",
+                "question_clarification": "question_clarification",
+                "knowledge_not_found": "knowledge_not_found",
             },
         )
         graph.add_edge("finalizer", END)
-        graph.add_edge("insufficient_evidence", END)
         graph.add_edge("direct_answer", END)
+        graph.add_edge("knowledge_not_found", END)
 
     async def prepare_request(self, state: GraphState) -> dict[str, Any]:
         """Extract the latest user query and reset per-request loop fields."""
@@ -245,10 +345,17 @@ class AgentLoop:
             "entities": [],
             "constraints": [],
             "answer_requirements": [],
+            "allowed_target_uris": ["viking://resources"],
+            "system_name": "",
+            "system_scope_explicit": False,
+            "hitl_retry_used": False,
             "retrieval_tasks": [],
             "executed_queries": [],
             "executed_operations": [],
             "retrieval_round": 0,
+            "retrieval_stage": "initial_find",
+            "active_retrieval_query": user_query,
+            "grep_pattern": "",
             "raw_results": [],
             "candidate_uris": [],
             "candidate_items": [],
@@ -331,7 +438,7 @@ class AgentLoop:
             "route": (
                 "role_clarification"
                 if needs_role_clarification
-                else "retrieval_planner"
+                else "initial_find"
                 if analysis.needs_retrieval
                 else "direct_answer"
             ),
@@ -362,82 +469,66 @@ class AgentLoop:
             "role_confidence": 1.0,
             "role_evidence": ["用户通过角色澄清确认"],
             "needs_role_clarification": False,
-            "route": "retrieval_planner" if state.needs_retrieval else "direct_answer",
+            "route": "system_scope_determination" if state.needs_retrieval else "direct_answer",
         }
 
-    async def _create_plan(self, state: GraphState, *, repair: bool) -> list[RetrievalTask]:
-        """Create and normalize a bounded retrieval plan."""
-        requirements = _parse_answer_requirements(state.answer_requirements)
-        missing_required_ids = set(state.missing_required_ids) if repair else set()
-        payload = {
-            "query": state.normalized_query,
-            "intent": state.intent,
-            "role": state.user_role,
-            "answer_requirements": [item.model_dump() for item in requirements],
-            "missing_requirements": [
-                item.model_dump() for item in requirements if item.requirement_id in missing_required_ids
-            ],
-            "allowed_target_uris": state.allowed_target_uris,
-            "executed_queries": state.executed_queries,
-            "retrieval_round": state.retrieval_round,
-        }
-        plan = await self.llm_service.call(
+    async def system_scope_determination(self, state: GraphState) -> dict[str, Any]:
+        """Use the LLM to constrain retrieval to an explicitly named root system."""
+        scope = await self.llm_service.call(
             [
-                SystemMessage(content=get_agentic_rag_prompt("retrieval_planner")),
-                HumanMessage(content=_json(payload)),
+                SystemMessage(content=get_agentic_rag_prompt("system_scope_determination")),
+                HumanMessage(content=_json({"query": state.normalized_query})),
             ],
-            response_format=RetrievalPlan,
+            response_format=SystemScopeResult,
         )
-
-        tasks: list[RetrievalTask] = []
-        for index, task in enumerate(plan.tasks[:MAX_PARALLEL_TASKS], start=1):
-            target_uri = task.target_uri.rstrip("/") or state.allowed_target_uris[0]
-            if not _is_allowed_uri(target_uri, state.allowed_target_uris):
-                target_uri = state.allowed_target_uris[0]
-            tasks.append(
-                task.model_copy(
-                    update={
-                        "task_id": task.task_id or f"r{state.retrieval_round + 1}_{index}",
-                        "target_uri": target_uri,
-                        "limit": min(task.limit, MAX_RESULTS_PER_TASK),
-                        "node_limit": min(task.node_limit, MAX_LISTED_RESOURCES),
-                    }
-                )
+        system_name = _normalize_system_name(scope.system_name) if scope.system_explicit else None
+        system_explicit = system_name is not None
+        root_uri = (
+            f"viking://resources/{system_name}"
+            if system_name is not None
+            else "viking://resources"
+        )
+        if scope.system_explicit and not system_explicit:
+            logger.warning(
+                "invalid_system_scope_ignored",
+                proposed_system_name=scope.system_name,
             )
+        return {
+            "normalized_query": scope.scoped_query.strip(),
+            "allowed_target_uris": [root_uri],
+            "system_name": system_name or "",
+            "system_scope_explicit": system_explicit,
+            "route": "initial_find",
+        }
 
-        needs_directory_listing = any(term in state.normalized_query for term in _DIRECTORY_TERMS)
-        if needs_directory_listing and not any(task.operation == "list_resources" for task in tasks):
-            tasks.insert(
-                0,
-                RetrievalTask(
-                    task_id=f"r{state.retrieval_round + 1}_list",
-                    purpose="列出知识库授权范围内的目录和文件",
-                    operation="list_resources",
-                    information_need=state.normalized_query,
-                    target_uri=state.allowed_target_uris[0],
-                    recursive=False,
-                    node_limit=MAX_LISTED_RESOURCES,
-                    hydration_level="overview",
-                ),
-            )
-            tasks = tasks[:MAX_PARALLEL_TASKS]
-        return tasks
-
-    async def retrieval_planner(self, state: GraphState) -> dict[str, Any]:
-        """Plan first-round OpenViking operations."""
-        tasks = await self._create_plan(state, repair=False)
-        logger.info("retrieval_plan_created", task_count=len(tasks), retrieval_round=state.retrieval_round + 1)
-        return {"retrieval_tasks": [task.model_dump() for task in tasks], "route": "query_rewrite"}
+    async def initial_find(self, state: GraphState) -> dict[str, Any]:
+        """Create the fixed first-round semantic find task."""
+        query = state.normalized_query.strip()
+        task = RetrievalTask(
+            task_id="initial_find",
+            purpose="使用用户原始问题进行首轮语义检索",
+            operation="find",
+            information_need=query,
+            target_uri=state.allowed_target_uris[0],
+            query=query,
+            limit=MAX_RESULTS_PER_TASK,
+            hydration_level="full",
+        )
+        return {
+            "retrieval_tasks": [task.model_dump()],
+            "retrieval_stage": "initial_find",
+            "active_retrieval_query": query,
+            "grep_pattern": "",
+            "raw_results": [],
+            "candidate_uris": [],
+            "candidate_items": [],
+            "route": "retrieval_executor",
+        }
 
     async def query_rewrite(self, state: GraphState) -> dict[str, Any]:
-        """Rewrite all find tasks using the confirmed role."""
-        tasks = [RetrievalTask.model_validate(task) for task in state.retrieval_tasks]
+        """Rewrite the failed initial query for exactly one semantic retry."""
         requirements = _parse_answer_requirements(state.answer_requirements)
         missing_required_ids = set(state.missing_required_ids)
-        find_tasks = [task for task in tasks if task.operation == "find"]
-        if not find_tasks:
-            return {"route": "retrieval_executor"}
-
         rewrite = await self.llm_service.call(
             [
                 SystemMessage(content=get_agentic_rag_prompt("query_rewrite")),
@@ -446,7 +537,13 @@ class AgentLoop:
                         {
                             "query": state.normalized_query,
                             "role": state.user_role,
-                            "tasks": [task.model_dump() for task in find_tasks],
+                            "tasks": [
+                                {
+                                    "task_id": "rewritten_find",
+                                    "operation": "find",
+                                    "information_need": state.normalized_query,
+                                }
+                            ],
                             "executed_queries": state.executed_queries,
                             "missing_requirements": [
                                 item.model_dump()
@@ -459,14 +556,82 @@ class AgentLoop:
             ],
             response_format=QueryRewriteResult,
         )
-        query_by_task = {item.task_id: item.query.strip() for item in rewrite.queries}
-        updated_tasks: list[dict[str, Any]] = []
-        for task in tasks:
-            if task.operation == "find":
-                query = query_by_task.get(task.task_id) or task.information_need
-                task = task.model_copy(update={"query": query})
-            updated_tasks.append(task.model_dump())
-        return {"retrieval_tasks": updated_tasks, "route": "retrieval_executor"}
+        query = next(
+            (item.query.strip() for item in rewrite.queries if item.query.strip()),
+            state.normalized_query,
+        )
+        task = RetrievalTask(
+            task_id="rewritten_find",
+            purpose="使用改写后的问题进行一次语义检索重试",
+            operation="find",
+            information_need=state.normalized_query,
+            target_uri=state.allowed_target_uris[0],
+            query=query,
+            limit=MAX_RESULTS_PER_TASK,
+            hydration_level="full",
+        )
+        return {
+            "retrieval_tasks": [task.model_dump()],
+            "retrieval_stage": "rewritten_find",
+            "active_retrieval_query": query,
+            "raw_results": [],
+            "candidate_uris": [],
+            "candidate_items": [],
+            "route": "retrieval_executor",
+        }
+
+    async def grep_query_builder(self, state: GraphState) -> dict[str, Any]:
+        """Build one escaped keyword regex for the final retrieval round."""
+        requirements = _parse_answer_requirements(state.answer_requirements)
+        missing_required_ids = set(state.missing_required_ids)
+        keyword_result = await self.llm_service.call(
+            [
+                SystemMessage(content=get_agentic_rag_prompt("grep_query_builder")),
+                HumanMessage(
+                    content=_json(
+                        {
+                            "query": state.normalized_query,
+                            "rewritten_query": state.active_retrieval_query,
+                            "entities": state.entities,
+                            "executed_queries": state.executed_queries,
+                            "missing_requirements": [
+                                item.model_dump()
+                                for item in requirements
+                                if item.requirement_id in missing_required_ids
+                            ],
+                        }
+                    )
+                ),
+            ],
+            response_format=GrepKeywordResult,
+        )
+        keywords = list(
+            dict.fromkeys(
+                keyword.strip()
+                for keyword in keyword_result.keywords
+                if keyword.strip()
+            )
+        )
+        pattern = "|".join(re.escape(keyword) for keyword in keywords)
+        task = RetrievalTask(
+            task_id="grep_keywords",
+            purpose="使用关键词精确匹配知识库正文",
+            operation="grep",
+            information_need="；".join(keywords),
+            target_uri=state.allowed_target_uris[0],
+            query=pattern,
+            node_limit=MAX_HYDRATED_RESOURCES,
+            hydration_level="full",
+        )
+        return {
+            "retrieval_tasks": [task.model_dump()],
+            "retrieval_stage": "grep",
+            "grep_pattern": pattern,
+            "raw_results": [],
+            "candidate_uris": [],
+            "candidate_items": [],
+            "route": "retrieval_executor",
+        }
 
     async def retrieval_executor(self, state: GraphState) -> dict[str, Any]:
         """Execute only the planned read-only OpenViking operations."""
@@ -478,14 +643,14 @@ class AgentLoop:
                 try:
                     if task.operation == "find":
                         result = await self.openviking_api.find(task.query, task.target_uri, task.limit)
-                    elif task.operation == "list_resources":
-                        result = await self.openviking_api.list_resources(
-                            task.target_uri,
-                            task.recursive,
-                            task.node_limit,
-                        )
                     else:
-                        result = await self.openviking_api.stat(task.target_uri)
+                        result = await self.openviking_api.grep(
+                            task.query,
+                            task.target_uri,
+                            case_insensitive=True,
+                            node_limit=task.node_limit,
+                            level_limit=10,
+                        )
                     return {
                         "ok": True,
                         "task_id": task.task_id,
@@ -513,7 +678,7 @@ class AgentLoop:
         queries = [
             task.query
             for task in tasks
-            if task.operation == "find" and task.query and task.query not in state.executed_queries
+            if task.query and task.query not in state.executed_queries
         ]
         operations = [
             {
@@ -538,29 +703,40 @@ class AgentLoop:
         }
 
     async def result_fusion(self, state: GraphState) -> dict[str, Any]:
-        """Fuse heterogeneous API results into a deduplicated URI set."""
+        """Normalize, deduplicate, and rank heterogeneous OpenViking results."""
         by_uri: dict[str, dict[str, Any]] = {}
-        for raw in state.raw_results:
+        for task_order, raw in enumerate(state.raw_results):
             if not raw.get("ok"):
                 continue
-            for item in _iter_uri_items(raw.get("result")):
+            operation = str(raw["operation"])
+            for source_rank, item in enumerate(_iter_uri_items(raw.get("result"))):
                 uri = str(item["uri"])
                 if not _is_allowed_uri(uri, state.allowed_target_uris):
                     continue
-                score = item.get("score", item.get("similarity", 0.0))
+                score = _numeric_score(item) if operation == "find" else None
                 candidate = {
                     "uri": uri,
-                    "score": float(score) if isinstance(score, (int, float)) else 0.0,
+                    "score": score,
                     "task_id": raw["task_id"],
-                    "operation": raw["operation"],
+                    "task_ids": [raw["task_id"]],
+                    "operation": operation,
+                    "operations": [operation],
+                    "source_level": (
+                        _normalize_source_level(item.get("level"))
+                        if operation == "find"
+                        else "full"
+                        if operation == "grep"
+                        else None
+                    ),
+                    "is_directory": False,
+                    "task_order": task_order,
+                    "source_rank": source_rank,
                     "metadata": item,
                 }
                 current = by_uri.get(uri)
-                if current is None or candidate["score"] > current["score"]:
-                    by_uri[uri] = candidate
+                by_uri[uri] = candidate if current is None else _merge_candidates(current, candidate)
 
-        candidates = sorted(by_uri.values(), key=lambda item: item["score"], reverse=True)
-        candidates = candidates[:MAX_HYDRATED_RESOURCES]
+        candidates = _select_fused_candidates(list(by_uri.values()))
         return {
             "candidate_uris": [candidate["uri"] for candidate in candidates],
             "candidate_items": candidates,
@@ -590,10 +766,25 @@ class AgentLoop:
                         "task_id": candidate["task_id"],
                     }
                 )
+            if candidate.get("operation") == "grep" and isinstance(metadata, dict):
+                match_content = metadata.get("content")
+                if match_content:
+                    evidence.append(
+                        {
+                            "uri": uri,
+                            "level": "grep_match",
+                            "content": str(match_content),
+                            "line": metadata.get("line"),
+                            "task_id": candidate["task_id"],
+                        }
+                    )
 
             task = task_by_id.get(candidate["task_id"])
-            is_directory = bool(metadata.get("isDir") or metadata.get("is_dir")) if isinstance(metadata, dict) else False
-            first_level: Literal["abstract", "overview", "full"] = "overview" if is_directory else "abstract"
+            operation = candidate.get("operation")
+            source_level = _normalize_source_level(candidate.get("source_level"))
+            if source_level is None and operation == "find" and isinstance(metadata, dict):
+                source_level = _normalize_source_level(metadata.get("level"))
+            first_level: SourceLevel = source_level or "abstract"
             async with semaphore:
                 try:
                     first_content = await self.openviking_api.read(uri, first_level)
@@ -606,7 +797,11 @@ class AgentLoop:
                         }
                     )
                     wants_full = task is not None and task.hydration_level == "full"
-                    if not is_directory and wants_full and index < MAX_FULL_CONTENT_RESOURCES:
+                    if (
+                        first_level != "full"
+                        and wants_full
+                        and index < MAX_FULL_CONTENT_RESOURCES
+                    ):
                         full_content = await self.openviking_api.read(uri, "full")
                         evidence.append(
                             {
@@ -663,9 +858,7 @@ class AgentLoop:
                 "covered_optional_ids": [],
                 "missing_optional_ids": optional_ids,
                 "route": (
-                    "retrieval_repair"
-                    if required_ids and state.retrieval_round < MAX_RETRIEVAL_ROUNDS
-                    else "insufficient_evidence"
+                    _next_retrieval_route(state.retrieval_stage, state.hitl_retry_used)
                     if required_ids
                     else "answer_generator"
                 ),
@@ -710,10 +903,8 @@ class AgentLoop:
 
         if required_sufficient:
             route = "answer_generator"
-        elif state.retrieval_round < MAX_RETRIEVAL_ROUNDS:
-            route = "retrieval_repair"
         else:
-            route = "insufficient_evidence"
+            route = _next_retrieval_route(state.retrieval_stage, state.hitl_retry_used)
         return {
             "covered_required_ids": covered_required_ids,
             "missing_required_ids": missing_required_ids,
@@ -722,15 +913,88 @@ class AgentLoop:
             "route": route,
         }
 
-    async def retrieval_repair(self, state: GraphState) -> dict[str, Any]:
-        """Plan the next bounded retrieval round from evidence gaps."""
-        tasks = await self._create_plan(state, repair=True)
+    async def question_clarification(self, state: GraphState) -> dict[str, Any]:
+        """Interrupt after exhausted retrieval and collect missing user context."""
+        requirements = _parse_answer_requirements(state.answer_requirements)
+        missing_id_set = set(state.missing_required_ids)
+        missing_descriptions = [
+            item.description
+            for item in requirements
+            if item.priority == "required" and item.requirement_id in missing_id_set
+        ]
+        if state.system_scope_explicit:
+            question = (
+                f"在“{state.system_name}”系统知识库中，现有问题和证据仍不足。"
+                "请进一步明确提问对象、版本、场景、现象和期望结果。"
+            )
+        else:
+            question = (
+                "现有问题和知识库证据仍不足。请声明需要查询哪个系统的知识库，"
+                "并明确具体问题、对象、版本、场景或期望结果。"
+            )
+        prompt: dict[str, Any] = {
+            "type": "question_clarification",
+            "question": question,
+            "original_query": state.user_query,
+            "current_system": state.system_name or None,
+            "requires_system_name": not state.system_scope_explicit,
+            "missing_information": missing_descriptions,
+        }
+        supplement = ""
+        while not supplement:
+            raw_answer = interrupt(prompt)
+            if isinstance(raw_answer, dict):
+                raw_answer = (
+                    raw_answer.get("answer")
+                    or raw_answer.get("content")
+                    or raw_answer.get("value")
+                    or ""
+                )
+            supplement = str(raw_answer).strip()
+            if not supplement:
+                prompt = {**prompt, "error": "补充信息不能为空。"}
+
+        combined_query = f"{state.user_query}\n用户补充：{supplement}".strip()
         return {
-            "retrieval_tasks": [task.model_dump() for task in tasks],
+            "messages": [HumanMessage(content=f"补充信息：{supplement}")],
+            "user_query": combined_query,
+            "normalized_query": combined_query,
+            "allowed_target_uris": ["viking://resources"],
+            "system_name": "",
+            "system_scope_explicit": False,
+            "hitl_retry_used": True,
+            "retrieval_tasks": [],
+            "executed_queries": [],
+            "executed_operations": [],
+            "retrieval_round": 0,
+            "retrieval_stage": "initial_find",
+            "active_retrieval_query": combined_query,
+            "grep_pattern": "",
             "raw_results": [],
             "candidate_uris": [],
             "candidate_items": [],
-            "route": "query_rewrite",
+            "hydrated_evidence": [],
+            "selected_evidence": [],
+            "covered_required_ids": [],
+            "missing_required_ids": [],
+            "covered_optional_ids": [],
+            "missing_optional_ids": [],
+            "revision_instructions": "",
+            "revision_count": 0,
+            "route": "intent_analyzer",
+        }
+
+    async def knowledge_not_found(self, state: GraphState) -> dict[str, Any]:
+        """Finish after the single post-HITL retrieval cycle is exhausted."""
+        if state.system_scope_explicit:
+            answer = f"在“{state.system_name}”系统知识库中检索不到足以回答该问题的信息。"
+        else:
+            answer = "在知识库中检索不到足以回答该问题的信息。"
+        return {
+            "draft_answer": answer,
+            "final_answer": answer,
+            "messages": [AIMessage(content=answer)],
+            "route": "knowledge_not_found",
         }
 
     async def answer_generator(self, state: GraphState) -> dict[str, Any]:
@@ -799,15 +1063,18 @@ class AgentLoop:
         elif (
             has_required_gap
             and assessment.action == "retrieve"
-            and state.retrieval_round < MAX_RETRIEVAL_ROUNDS
         ):
-            route = "retrieval_repair"
+            route = _next_retrieval_route(state.retrieval_stage, state.hitl_retry_used)
         elif state.revision_count < 1:
             route = "answer_generator"
         elif not has_required_gap and not assessment.unsupported_claims:
             route = "finalizer"
         else:
-            route = "insufficient_evidence"
+            route = (
+                "knowledge_not_found"
+                if state.hitl_retry_used
+                else "question_clarification"
+            )
 
         instructions = assessment.revision_instructions
         if not has_valid_citation:
@@ -826,31 +1093,6 @@ class AgentLoop:
             "final_answer": state.draft_answer,
             "messages": [AIMessage(content=state.draft_answer)],
             "route": "completed",
-        }
-
-    async def insufficient_evidence(self, state: GraphState) -> dict[str, Any]:
-        """Return an explicit no-guess response after bounded retries."""
-        requirements = _parse_answer_requirements(state.answer_requirements)
-        missing_id_set = set(state.missing_required_ids)
-        missing = [
-            item.description
-            for item in requirements
-            if item.priority == "required" and item.requirement_id in missing_id_set
-        ]
-        if not missing:
-            missing = [item.description for item in requirements if item.priority == "required"]
-        sources = sorted({item["uri"] for item in state.selected_evidence if item.get("uri")})
-        parts = [
-            "当前知识库证据不足，我不会继续推测。",
-            f"尚缺少的信息：{'；'.join(missing)}" if missing else "未检索到可直接支持结论的内容。",
-        ]
-        if sources:
-            parts.append(f"已核查来源：{'、'.join(sources)}")
-        answer = "\n\n".join(parts)
-        return {
-            "final_answer": answer,
-            "messages": [AIMessage(content=answer)],
-            "route": "insufficient_evidence",
         }
 
     async def direct_answer(self, state: GraphState) -> dict[str, Any]:
@@ -880,27 +1122,42 @@ class AgentLoop:
     @staticmethod
     def route_after_intent(
         state: GraphState,
-    ) -> Literal["role_clarification", "retrieval_planner", "direct_answer"]:
+    ) -> Literal["role_clarification", "system_scope_determination", "direct_answer"]:
         """Route after intent and role analysis."""
         if state.needs_role_clarification:
             return "role_clarification"
-        return "retrieval_planner" if state.needs_retrieval else "direct_answer"
+        return "system_scope_determination" if state.needs_retrieval else "direct_answer"
 
     @staticmethod
-    def route_after_role(state: GraphState) -> Literal["retrieval_planner", "direct_answer"]:
+    def route_after_role(
+        state: GraphState,
+    ) -> Literal["system_scope_determination", "direct_answer"]:
         """Continue the original request after HITL role confirmation."""
-        return "retrieval_planner" if state.needs_retrieval else "direct_answer"
+        return "system_scope_determination" if state.needs_retrieval else "direct_answer"
 
     @staticmethod
     def route_after_evidence(
         state: GraphState,
-    ) -> Literal["answer_generator", "retrieval_repair", "insufficient_evidence"]:
+    ) -> Literal[
+        "answer_generator",
+        "query_rewrite",
+        "grep_query_builder",
+        "question_clarification",
+        "knowledge_not_found",
+    ]:
         """Route according to evidence coverage and retry budget."""
         return state.route  # type: ignore[return-value]
 
     @staticmethod
     def route_after_verification(
         state: GraphState,
-    ) -> Literal["finalizer", "answer_generator", "retrieval_repair", "insufficient_evidence"]:
+    ) -> Literal[
+        "finalizer",
+        "answer_generator",
+        "query_rewrite",
+        "grep_query_builder",
+        "question_clarification",
+        "knowledge_not_found",
+    ]:
         """Route according to groundedness and revision budgets."""
         return state.route  # type: ignore[return-value]

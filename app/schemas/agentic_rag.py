@@ -13,7 +13,7 @@ from pydantic import (
 
 UserRole = Literal["product_manager", "developer", "new_employee"]
 RoleSource = Literal["profile", "explicit", "inferred", "hitl"]
-RetrievalOperation = Literal["find", "list_resources", "stat"]
+RetrievalOperation = Literal["find", "grep"]
 HydrationLevel = Literal["abstract", "overview", "full"]
 RequirementPriority = Literal["required", "optional"]
 RequirementEvidenceSource = Literal["knowledge_base", "user_context", "knowledge_and_context"]
@@ -70,15 +70,8 @@ class RetrievalTask(BaseModel):
     target_uri: str = Field(default="viking://resources", max_length=1000)
     query: str = Field(default="", max_length=2000)
     limit: int = Field(default=8, ge=1, le=10)
-    recursive: bool = False
     node_limit: int = Field(default=100, ge=1, le=100)
     hydration_level: HydrationLevel = "full"
-
-
-class RetrievalPlan(BaseModel):
-    """Structured retrieval plan."""
-
-    tasks: list[RetrievalTask] = Field(min_length=1, max_length=4)
 
 
 class RewrittenQuery(BaseModel):
@@ -92,6 +85,29 @@ class QueryRewriteResult(BaseModel):
     """Structured output for all find-task rewrites."""
 
     queries: list[RewrittenQuery] = Field(default_factory=list, max_length=4)
+
+
+class GrepKeywordResult(BaseModel):
+    """Literal keywords used to build one bounded grep regex."""
+
+    keywords: list[str] = Field(min_length=1, max_length=5)
+
+
+class SystemScopeResult(BaseModel):
+    """LLM assessment of an explicitly requested root-level system scope."""
+
+    system_explicit: bool
+    system_name: str | None = Field(default=None, max_length=200)
+    scoped_query: str = Field(min_length=1, max_length=2000)
+
+    @model_validator(mode="after")
+    def validate_explicit_system(self) -> Self:
+        """Require a system name only when the user explicitly supplied one."""
+        if self.system_explicit and not (self.system_name or "").strip():
+            raise ValueError("system_name is required when system_explicit is true")
+        if not self.system_explicit:
+            self.system_name = None
+        return self
 
 
 class EvidenceAssessment(BaseModel):

@@ -39,11 +39,17 @@ class GraphState(BaseModel):
     constraints: list[str] = Field(default_factory=list)
     answer_requirements: list[dict[str, Any] | str] = Field(default_factory=list)
     allowed_target_uris: list[str] = Field(default_factory=lambda: ["viking://resources"])
+    system_name: str = ""
+    system_scope_explicit: bool = False
+    hitl_retry_used: bool = False
 
     retrieval_tasks: list[dict[str, Any]] = Field(default_factory=list)
     executed_queries: list[str] = Field(default_factory=list)
     executed_operations: list[dict[str, Any]] = Field(default_factory=list)
     retrieval_round: int = 0
+    retrieval_stage: str = "initial_find"
+    active_retrieval_query: str = ""
+    grep_pattern: str = ""
 
     raw_results: list[dict[str, Any]] = Field(default_factory=list)
     candidate_uris: list[str] = Field(default_factory=list)

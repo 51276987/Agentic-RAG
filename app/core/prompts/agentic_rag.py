@@ -5,8 +5,9 @@ from pathlib import Path
 _PROMPT_DIR = Path(__file__).with_name("agentic_rag_prompts")
 _PROMPT_NAMES = (
     "intent_analyzer",
-    "retrieval_planner",
+    "system_scope_determination",
     "query_rewrite",
+    "grep_query_builder",
     "evidence_grader",
     "answer_generator",
     "groundedness_verifier",

@@ -4,12 +4,13 @@ from app.schemas.auth import Token
 from app.schemas.agentic_rag import (
     AnswerRequirement,
     EvidenceAssessment,
+    GrepKeywordResult,
     GroundednessAssessment,
     IntentAnalysis,
     QueryRewriteResult,
     RewrittenQuery,
-    RetrievalPlan,
     RetrievalTask,
+    SystemScopeResult,
 )
 from app.schemas.base import BaseResponse
 from app.schemas.chat import (
@@ -25,9 +26,10 @@ __all__ = [
     "AnswerRequirement",
     "IntentAnalysis",
     "RetrievalTask",
-    "RetrievalPlan",
+    "SystemScopeResult",
     "QueryRewriteResult",
     "RewrittenQuery",
+    "GrepKeywordResult",
     "EvidenceAssessment",
     "GroundednessAssessment",
     "BaseResponse",

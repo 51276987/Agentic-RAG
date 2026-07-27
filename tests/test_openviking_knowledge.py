@@ -53,6 +53,36 @@ def test_find_forces_resource_context_type() -> None:
     )
 
 
+def test_grep_uses_bounded_content_search_contract() -> None:
+    """Keyword fallback should call the documented read-only grep endpoint."""
+    client = OpenVikingKnowledgeAPI()
+    request = AsyncMock(return_value={"matches": [], "count": 0})
+    client._request = request  # pyright: ignore[reportPrivateUsage]
+
+    result = asyncio.run(
+        client.grep(
+            "authentication|token",
+            "viking://resources/docs",
+            case_insensitive=True,
+            node_limit=8,
+            level_limit=10,
+        )
+    )
+
+    assert result == {"matches": [], "count": 0}
+    request.assert_awaited_once_with(
+        "POST",
+        "/api/v1/search/grep",
+        json_body={
+            "uri": "viking://resources/docs",
+            "pattern": "authentication|token",
+            "case_insensitive": True,
+            "node_limit": 8,
+            "level_limit": 10,
+        },
+    )
+
+
 def test_delete_api_requires_explicit_confirmation() -> None:
     """The API must reject deletion until its caller completes HITL."""
     client = OpenVikingKnowledgeAPI()

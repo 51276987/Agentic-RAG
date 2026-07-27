@@ -321,7 +321,7 @@ class LangGraphAgent:
             ):
                 if not isinstance(update, dict):
                     continue
-                for node_name in ("finalizer", "direct_answer", "insufficient_evidence"):
+                for node_name in ("finalizer", "direct_answer", "knowledge_not_found"):
                     node_update = update.get(node_name)
                     if not isinstance(node_update, dict):
                         continue

@@ -174,6 +174,41 @@ class OpenVikingKnowledgeAPI:
             },
         )
 
+    async def grep(
+        self,
+        pattern: str,
+        target_uri: str = "viking://resources",
+        *,
+        case_insensitive: bool = True,
+        node_limit: int = 100,
+        level_limit: int = 10,
+    ) -> Any:
+        """Search resource content using one bounded regular expression."""
+        normalized_pattern = pattern.strip()
+        if not normalized_pattern or len(normalized_pattern) > 2000:
+            raise ValueError("pattern 长度必须在 1 到 2000 之间")
+        return await self._request(
+            "POST",
+            "/api/v1/search/grep",
+            json_body={
+                "uri": _validate_resource_uri(target_uri),
+                "pattern": normalized_pattern,
+                "case_insensitive": case_insensitive,
+                "node_limit": _bounded_int(
+                    node_limit,
+                    name="node_limit",
+                    minimum=1,
+                    maximum=500,
+                ),
+                "level_limit": _bounded_int(
+                    level_limit,
+                    name="level_limit",
+                    minimum=1,
+                    maximum=20,
+                ),
+            },
+        )
+
     async def list_resources(
         self,
         uri: str = "viking://resources",
