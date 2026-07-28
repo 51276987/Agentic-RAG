@@ -8,7 +8,7 @@ from langchain_core.messages import (
     AIMessage,
     HumanMessage,
 )
-from langgraph.graph import StateGraph
+from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
@@ -33,21 +33,36 @@ class FakeLLMService:
     def __init__(self, responses: list[Any]):
         """Initialize the fake with ordered responses."""
         self.responses = responses
+        self.calls: list[tuple[Any, Any]] = []
 
-    async def call(self, messages: Any, model_name: str | None = None, response_format: Any = None, **kwargs: Any) -> Any:
+    async def call(
+        self, messages: Any, model_name: str | None = None, response_format: Any = None, **kwargs: Any
+    ) -> Any:
         """Return the next predefined response."""
         del model_name, kwargs
+        self.calls.append((messages, response_format))
         if response_format is SystemScopeResult and (
             not self.responses or not isinstance(self.responses[0], SystemScopeResult)
         ):
             payload = json.loads(messages[-1].content)
             return SystemScopeResult(
-                system_explicit=False,
+                scope_confident=False,
                 scoped_query=payload["query"],
             )
         if not self.responses:
             raise AssertionError("unexpected LLM call")
         return self.responses.pop(0)
+
+    async def stream(self, messages: Any) -> Any:
+        """Stream a predefined direct answer or the already verified draft."""
+        self.calls.append((messages, "stream"))
+        if self.responses and isinstance(self.responses[0], AIMessage):
+            text = self.responses.pop(0).content
+        else:
+            payload = json.loads(messages[-1].content)
+            text = payload["verified_draft"]
+        for index in range(0, len(text), 7):
+            yield text[index : index + 7]
 
 
 class FakeOpenVikingAPI:
@@ -57,11 +72,34 @@ class FakeOpenVikingAPI:
         self,
         find_results: list[Any] | None = None,
         grep_results: list[Any] | None = None,
+        resource_list: list[dict[str, Any]] | None = None,
     ):
         """Initialize an empty call log."""
         self.calls: list[tuple[Any, ...]] = []
         self.find_results = list(find_results or [])
         self.grep_results = list(grep_results or [])
+        self.resource_list = resource_list or [
+            {
+                "uri": "viking://resources/支付系统",
+                "isDir": True,
+                "abstract": "支付相关系统知识库",
+            },
+            {
+                "uri": "viking://resources/营销系统",
+                "isDir": True,
+                "abstract": "营销相关系统知识库",
+            },
+        ]
+
+    async def list_resources(
+        self,
+        uri: str = "viking://resources",
+        recursive: bool = False,
+        node_limit: int = 100,
+    ) -> Any:
+        """Return real-looking root folder candidates."""
+        self.calls.append(("list_resources", uri, recursive, node_limit))
+        return self.resource_list
 
     async def find(self, query: str, target_uri: str, limit: int) -> Any:
         """Record a semantic retrieval call."""
@@ -212,6 +250,37 @@ def test_evidence_hydration_reads_find_level_two_as_full_content() -> None:
     assert any(item["level"] == "full" for item in result["selected_evidence"])
 
 
+def test_finalizer_emits_model_tokens_through_custom_stream() -> None:
+    """Only the post-verification finalizer should expose model token chunks."""
+    verified_draft = "这是经过证据与引用校验的最终回答。"
+    llm = FakeLLMService([])
+    loop = AgentLoop(llm, FakeOpenVikingAPI())  # pyright: ignore[reportArgumentType]
+    builder = StateGraph(GraphState)
+    builder.add_node("finalizer", loop.finalizer)
+    builder.add_edge(START, "finalizer")
+    builder.add_edge("finalizer", END)
+    graph = builder.compile()
+
+    async def collect() -> tuple[list[str], dict[str, Any]]:
+        chunks: list[str] = []
+        final_update: dict[str, Any] = {}
+        async for mode, payload in graph.astream(
+            GraphState(draft_answer=verified_draft),
+            stream_mode=["custom", "updates"],
+        ):
+            if mode == "custom":
+                chunks.append(payload["content"])
+            elif mode == "updates" and "finalizer" in payload:
+                final_update = payload["finalizer"]
+        return chunks, final_update
+
+    chunks, final_update = asyncio.run(collect())
+
+    assert len(chunks) > 1
+    assert "".join(chunks) == verified_draft
+    assert final_update["final_answer"] == verified_draft
+
+
 def test_agent_loop_runs_read_only_retrieval_to_verified_answer() -> None:
     """An explicit role should proceed through retrieval without HITL."""
     llm = FakeLLMService(
@@ -296,8 +365,8 @@ def test_system_scope_limits_all_retrieval_to_explicit_system_folder() -> None:
                 ],
             ),
             SystemScopeResult(
-                system_explicit=True,
-                system_name="支付系统",
+                scope_confident=True,
+                selected_uri="viking://resources/支付系统",
                 scoped_query="仅查询支付系统知识库：认证配置是什么？",
             ),
             EvidenceAssessment(
@@ -308,9 +377,7 @@ def test_system_scope_limits_all_retrieval_to_explicit_system_folder() -> None:
                 missing_optional_ids=[],
                 reason="已找到支付系统认证配置",
             ),
-            AIMessage(
-                content="支付系统使用令牌认证。[来源: viking://resources/支付系统/auth.md]"
-            ),
+            AIMessage(content="支付系统使用令牌认证。[来源: viking://resources/支付系统/auth.md]"),
             GroundednessAssessment(
                 passed=True,
                 action="pass",
@@ -346,10 +413,90 @@ def test_system_scope_limits_all_retrieval_to_explicit_system_folder() -> None:
     assert result["system_name"] == "支付系统"
     assert result["allowed_target_uris"] == ["viking://resources/支付系统"]
     assert result["normalized_query"] == "仅查询支付系统知识库：认证配置是什么？"
+    assert ("list_resources", "viking://resources", False, 100) in api.calls
     find_call = next(call for call in api.calls if call[0] == "find")
     assert find_call[2] == "viking://resources/支付系统"
+    scope_call = next(call for call in llm.calls if call[1] is SystemScopeResult)
+    scope_payload = json.loads(scope_call[0][-1].content)
+    assert scope_payload["system_candidates"][0]["uri"] == "viking://resources/支付系统"
     assert result["route"] == "completed"
     assert not llm.responses
+
+
+def test_system_scope_keeps_root_when_llm_cannot_identify_one_candidate() -> None:
+    """Ambiguous system evidence must not narrow the retrieval URI."""
+    original_query = "我是开发，请查询认证配置"
+    llm = FakeLLMService(
+        [
+            SystemScopeResult(
+                scope_confident=False,
+                selected_uri=None,
+                scoped_query=original_query,
+                reason="问题没有声明系统，两个候选都可能相关",
+            )
+        ]
+    )
+    api = FakeOpenVikingAPI()
+    loop = AgentLoop(llm, api)  # pyright: ignore[reportArgumentType]
+
+    result = asyncio.run(loop.system_scope_determination(GraphState(normalized_query=original_query)))
+
+    assert result["allowed_target_uris"] == ["viking://resources"]
+    assert result["system_scope_explicit"] is False
+    assert result["system_name"] == ""
+    assert result["normalized_query"] == original_query
+    assert ("list_resources", "viking://resources", False, 100) in api.calls
+
+
+def test_system_scope_rejects_llm_uri_outside_listed_candidates() -> None:
+    """A confident model response still cannot select an unlisted folder."""
+    original_query = "查询不存在系统的认证配置"
+    llm = FakeLLMService(
+        [
+            SystemScopeResult(
+                scope_confident=True,
+                selected_uri="viking://resources/不存在系统",
+                scoped_query="仅查询不存在系统知识库：认证配置",
+                reason="模型错误生成了候选外 URI",
+            )
+        ]
+    )
+    api = FakeOpenVikingAPI()
+    loop = AgentLoop(llm, api)  # pyright: ignore[reportArgumentType]
+
+    result = asyncio.run(loop.system_scope_determination(GraphState(normalized_query=original_query)))
+
+    assert result["allowed_target_uris"] == ["viking://resources"]
+    assert result["system_scope_explicit"] is False
+    assert result["system_name"] == ""
+    assert result["normalized_query"] == original_query
+
+
+def test_prepare_request_clears_system_scope_inherited_from_history() -> None:
+    """A new question must never inherit the previous question's system scope."""
+    loop = AgentLoop(FakeLLMService([]), FakeOpenVikingAPI())  # pyright: ignore[reportArgumentType]
+    state = GraphState(
+        messages=[HumanMessage(content="请查询营销活动的配置")],
+        allowed_target_uris=["viking://resources/支付系统"],
+        system_name="支付系统",
+        system_scope_explicit=True,
+        system_options=[
+            {
+                "label": "支付系统",
+                "value": "viking://resources/支付系统",
+            }
+        ],
+        scope_determination_completed=True,
+    )
+
+    result = asyncio.run(loop.prepare_request(state))
+
+    assert result["user_query"] == "请查询营销活动的配置"
+    assert result["allowed_target_uris"] == ["viking://resources"]
+    assert result["system_name"] == ""
+    assert result["system_scope_explicit"] is False
+    assert result["system_options"] == []
+    assert result["scope_determination_completed"] is False
 
 
 def test_agent_loop_answers_greeting_without_role_clarification() -> None:
@@ -523,7 +670,7 @@ def test_agent_loop_uses_one_grep_round_then_requests_question_clarification() -
                 missing_optional_ids=[],
                 reason="用户补充版本后检索到完整证据",
             ),
-            AIMessage(content="请按 v2 配置并验证。[来源: viking://resources/auth_v2.md]"),
+            AIMessage(content="请按 v2 配置并验证。[来源: viking://resources/支付系统/auth_v2.md]"),
             GroundednessAssessment(
                 passed=True,
                 action="pass",
@@ -539,7 +686,7 @@ def test_agent_loop_uses_one_grep_round_then_requests_question_clarification() -
             [],
             [
                 {
-                    "uri": "viking://resources/auth_v2.md",
+                    "uri": "viking://resources/支付系统/auth_v2.md",
                     "level": 2,
                     "score": 0.95,
                 }
@@ -574,13 +721,26 @@ def test_agent_loop_uses_one_grep_round_then_requests_question_clarification() -
     assert grep_call[1] == "认证配置|验证命令"
     interrupt_value = snapshot.tasks[0].interrupts[0].value
     assert interrupt_value["type"] == "question_clarification"
+    assert interrupt_value["input_type"] == "system_and_question"
     assert interrupt_value["missing_information"] == ["说明认证配置和验证方法"]
-    assert interrupt_value["requires_system_name"] is True
+    assert interrupt_value["requires_system"] is True
+    assert interrupt_value["system_options"][0] == {
+        "label": "支付系统",
+        "value": "viking://resources/支付系统",
+    }
     assert "声明需要查询哪个系统的知识库" in interrupt_value["question"]
 
     resumed = asyncio.run(
         graph.ainvoke(
-            Command(resume="目标版本是 v2，需要部署后的验证命令"),
+            Command(
+                resume=json.dumps(
+                    {
+                        "system_uri": "viking://resources/支付系统",
+                        "question": "目标版本是 v2，需要部署后的验证命令",
+                    },
+                    ensure_ascii=False,
+                )
+            ),
             config=config,
         )
     )
@@ -589,8 +749,10 @@ def test_agent_loop_uses_one_grep_round_then_requests_question_clarification() -
     assert "用户补充：目标版本是 v2" in resumed["normalized_query"]
     assert resumed["retrieval_stage"] == "initial_find"
     assert resumed["retrieval_round"] == 1
+    assert resumed["allowed_target_uris"] == ["viking://resources/支付系统"]
     assert len([call for call in api.calls if call[0] == "find"]) == 3
     assert len([call for call in api.calls if call[0] == "grep"]) == 1
+    assert len([call for call in api.calls if call[0] == "list_resources"]) == 1
     assert not llm.responses
 
 
@@ -622,11 +784,6 @@ def test_second_exhausted_cycle_after_hitl_returns_knowledge_not_found() -> None
                 intent="procedure",
                 needs_retrieval=True,
                 answer_requirements=[requirement],
-            ),
-            SystemScopeResult(
-                system_explicit=True,
-                system_name="支付系统",
-                scoped_query="仅查询支付系统知识库：认证配置和验证方法",
             ),
             QueryRewriteResult(
                 queries=[
@@ -662,7 +819,15 @@ def test_second_exhausted_cycle_after_hitl_returns_knowledge_not_found() -> None
 
     resumed = asyncio.run(
         graph.ainvoke(
-            Command(resume="查询支付系统，问题是认证配置和部署后验证方法"),
+            Command(
+                resume=json.dumps(
+                    {
+                        "system_uri": "viking://resources/支付系统",
+                        "question": "认证配置和部署后验证方法",
+                    },
+                    ensure_ascii=False,
+                )
+            ),
             config=config,
         )
     )
@@ -673,6 +838,7 @@ def test_second_exhausted_cycle_after_hitl_returns_knowledge_not_found() -> None
     assert resumed["final_answer"] == "在“支付系统”系统知识库中检索不到足以回答该问题的信息。"
     assert len([call for call in api.calls if call[0] == "find"]) == 4
     assert len([call for call in api.calls if call[0] == "grep"]) == 2
+    assert len([call for call in api.calls if call[0] == "list_resources"]) == 1
     assert not llm.responses
 
 

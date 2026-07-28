@@ -24,12 +24,64 @@ from app.models.session import Session
 from app.schemas.chat import (
     ChatRequest,
     ChatResponse,
+    StreamDirectory,
+    StreamOption,
     StreamResponse,
 )
 from app.services.session_naming import maybe_name_session
 
 router = APIRouter()
 agent = LangGraphAgent()
+
+
+def _stream_response_from_chunk(chunk: str) -> StreamResponse:
+    """Promote structured HITL JSON from content to frontend-facing fields."""
+    try:
+        payload = json.loads(chunk)
+    except json.JSONDecodeError:
+        return StreamResponse(event="message", content=chunk, done=False)
+    if not isinstance(payload, dict):
+        return StreamResponse(event="message", content=chunk, done=False)
+
+    hitl_type = payload.get("type")
+    title = str(payload.get("question") or "需要您补充信息")
+    if hitl_type == "question_clarification":
+        directories = [
+            StreamDirectory(title=str(option["label"]), uri=str(option["value"]))
+            for option in payload.get("system_options", [])
+            if isinstance(option, dict) and option.get("label") and option.get("value")
+        ]
+        return StreamResponse(
+            event="hitl",
+            hitl_type="question_clarification",
+            title=title,
+            directories=directories,
+            done=False,
+        )
+    if hitl_type == "role_clarification":
+        options = [
+            StreamOption(title=str(option["label"]), value=str(option["value"]))
+            for option in payload.get("options", [])
+            if isinstance(option, dict) and option.get("label") and option.get("value")
+        ]
+        return StreamResponse(
+            event="hitl",
+            hitl_type="role_clarification",
+            title=title,
+            options=options,
+            done=False,
+        )
+    return StreamResponse(event="message", content=chunk, done=False)
+
+
+def _format_stream_event(response: StreamResponse) -> str:
+    """Serialize HITL with its custom prefix and all other events as SSE data."""
+    prefix = "hitl" if response.event == "hitl" else "data"
+    payload = json.dumps(
+        response.model_dump(mode="json", exclude_none=True),
+        ensure_ascii=False,
+    )
+    return f"{prefix}: {payload}\n\n"
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -118,12 +170,12 @@ async def chat_stream(
                     async for chunk in agent.get_stream_response(
                         chat_request.messages, session.id, user_id=str(session.user_id), username=session.username
                     ):
-                        response = StreamResponse(content=chunk, done=False)
-                        yield f"data: {json.dumps(response.model_dump(mode='json'))}\n\n"
+                        response = _stream_response_from_chunk(chunk)
+                        yield _format_stream_event(response)
 
                 # Send final message indicating completion
-                final_response = StreamResponse(content="", done=True)
-                yield f"data: {json.dumps(final_response.model_dump(mode='json'))}\n\n"
+                final_response = StreamResponse(event="done", content="", done=True)
+                yield _format_stream_event(final_response)
 
             except Exception as e:
                 logger.exception(
@@ -131,10 +183,17 @@ async def chat_stream(
                     session_id=session.id,
                     error=str(e),
                 )
-                error_response = StreamResponse(content=str(e), done=True)
-                yield f"data: {json.dumps(error_response.model_dump(mode='json'))}\n\n"
+                error_response = StreamResponse(event="error", content=str(e), done=True)
+                yield _format_stream_event(error_response)
 
-        return StreamingResponse(event_generator(), media_type="text/event-stream")
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     except Exception as e:
         logger.exception(

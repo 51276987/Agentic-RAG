@@ -286,7 +286,7 @@ class LangGraphAgent:
             username (Optional[str]): The display name of the user.
 
         Yields:
-            str: Tokens of the LLM response.
+            str: Bounded chunks of verified final output or a HITL payload.
         """
         langfuse_handler = get_langfuse_callback_handler()
         callbacks: list[BaseCallbackHandler] = [langfuse_handler] if langfuse_handler is not None else []
@@ -314,14 +314,25 @@ class LangGraphAgent:
                 relevant_memory = relevant_memory or "No relevant memory found."
                 graph_input = {"messages": dump_messages(messages), "long_term_memory": relevant_memory}
 
-            async for update in graph.astream(
+            async for stream_mode, update in graph.astream(
                 graph_input,
                 config,
-                stream_mode="updates",
+                stream_mode=["custom", "updates"],
             ):
+                if stream_mode == "custom":
+                    if (
+                        isinstance(update, dict)
+                        and update.get("type") == "final_answer_chunk"
+                        and isinstance(update.get("content"), str)
+                        and update["content"]
+                    ):
+                        yield update["content"]
+                    continue
+                if stream_mode != "updates":
+                    continue
                 if not isinstance(update, dict):
                     continue
-                for node_name in ("finalizer", "direct_answer", "knowledge_not_found"):
+                for node_name in ("knowledge_not_found",):
                     node_update = update.get(node_name)
                     if not isinstance(node_update, dict):
                         continue

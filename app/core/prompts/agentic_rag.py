@@ -11,6 +11,7 @@ _PROMPT_NAMES = (
     "evidence_grader",
     "answer_generator",
     "groundedness_verifier",
+    "final_answer_generator",
     "direct_answer",
 )
 AGENTIC_RAG_PROMPTS = {

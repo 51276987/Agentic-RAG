@@ -3,6 +3,8 @@
 import asyncio
 import logging
 from typing import (
+    AsyncGenerator,
+    AsyncIterator,
     Any,
     Callable,
     List,
@@ -36,6 +38,7 @@ from tenacity import (
 from app.core.config import settings
 from app.core.logging import logger
 from app.services.llm.registry import LLMRegistry
+from app.utils import extract_text_content
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -168,6 +171,19 @@ class LLMService:
             )
             raise RuntimeError(f"llm call timed out after {settings.LLM_TOTAL_TIMEOUT}s total budget")
 
+    async def stream(self, messages: LanguageModelInput) -> AsyncGenerator[str, None]:
+        """Stream text from the default model after retrying connection startup."""
+        async with asyncio.timeout(settings.LLM_TOTAL_TIMEOUT):
+            first_chunk, stream = await self._open_stream_with_retry(self._llm, messages)
+            first_text = extract_text_content(first_chunk.content)
+            if first_text:
+                yield first_text
+            async for chunk in stream:
+                text = extract_text_content(chunk.content)
+                if text:
+                    yield text
+        logger.debug("llm_stream_successful")
+
     def get_llm(self) -> Any:
         """Return the current tool-bound default LLM instance.
 
@@ -234,6 +250,26 @@ class LLMService:
                 error=str(e),
             )
             raise
+
+    @retry(
+        stop=stop_after_attempt(settings.MAX_LLM_CALL_RETRIES),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((RateLimitError, APITimeoutError, APIError)),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
+    async def _open_stream_with_retry(
+        self,
+        llm: Any,
+        messages: LanguageModelInput,
+    ) -> tuple[Any, AsyncIterator[Any]]:
+        """Open a model stream and obtain its first chunk before exposing output."""
+        stream = llm.astream(messages)
+        try:
+            first_chunk = await anext(stream)
+        except StopAsyncIteration as exc:
+            raise RuntimeError("llm stream completed without output") from exc
+        return first_chunk, stream
 
     def _switch_to_next_model(self) -> bool:
         """Advance the default model to the next entry in the registry (circular).

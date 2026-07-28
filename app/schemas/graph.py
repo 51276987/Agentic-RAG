@@ -41,6 +41,8 @@ class GraphState(BaseModel):
     allowed_target_uris: list[str] = Field(default_factory=lambda: ["viking://resources"])
     system_name: str = ""
     system_scope_explicit: bool = False
+    system_options: list[dict[str, str]] = Field(default_factory=list)
+    scope_determination_completed: bool = False
     hitl_retry_used: bool = False
 
     retrieval_tasks: list[dict[str, Any]] = Field(default_factory=list)

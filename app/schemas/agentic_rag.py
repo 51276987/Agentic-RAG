@@ -94,19 +94,20 @@ class GrepKeywordResult(BaseModel):
 
 
 class SystemScopeResult(BaseModel):
-    """LLM assessment of an explicitly requested root-level system scope."""
+    """LLM selection of one verified root-level system candidate."""
 
-    system_explicit: bool
-    system_name: str | None = Field(default=None, max_length=200)
+    scope_confident: bool
+    selected_uri: str | None = Field(default=None, max_length=1000)
     scoped_query: str = Field(min_length=1, max_length=2000)
+    reason: str = Field(default="", max_length=500)
 
     @model_validator(mode="after")
-    def validate_explicit_system(self) -> Self:
-        """Require a system name only when the user explicitly supplied one."""
-        if self.system_explicit and not (self.system_name or "").strip():
-            raise ValueError("system_name is required when system_explicit is true")
-        if not self.system_explicit:
-            self.system_name = None
+    def validate_selected_scope(self) -> Self:
+        """Require a selected candidate only for a confident match."""
+        if self.scope_confident and not (self.selected_uri or "").strip():
+            raise ValueError("selected_uri is required when scope_confident is true")
+        if not self.scope_confident:
+            self.selected_uri = None
         return self
 
 

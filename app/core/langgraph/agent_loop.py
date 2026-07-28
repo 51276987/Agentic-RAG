@@ -19,6 +19,7 @@ from langgraph.graph import (
     START,
     StateGraph,
 )
+from langgraph.config import get_stream_writer
 from langgraph.types import interrupt
 
 from app.core.logging import logger
@@ -43,6 +44,7 @@ MAX_RESULTS_PER_TASK = 10
 MAX_HYDRATED_RESOURCES = 8
 MAX_FULL_CONTENT_RESOURCES = 4
 MAX_EVIDENCE_CHARS = 24_000
+ROOT_RESOURCES_URI = "viking://resources"
 SourceLevel = Literal["abstract", "overview", "full"]
 
 _ROLE_LABELS = {
@@ -61,6 +63,8 @@ _ROLE_ALIASES = {
     "新入职员工": "new_employee",
     "新员工": "new_employee",
 }
+
+
 def _json(value: Any, *, max_chars: int | None = None) -> str:
     """Serialize prompt data without leaking non-serializable objects."""
     text = json.dumps(value, ensure_ascii=False, default=str)
@@ -97,6 +101,9 @@ def _extract_explicit_role(text: str) -> str | None:
 
 def _parse_role_answer(value: Any) -> str | None:
     """Normalize a HITL resume value to the supported role enum."""
+    parsed_value = _parse_json_object(value)
+    if parsed_value is not None:
+        value = parsed_value
     if isinstance(value, dict):
         value = value.get("value") or value.get("role") or value.get("answer")
     text = str(value).strip()
@@ -104,6 +111,19 @@ def _parse_role_answer(value: Any) -> str | None:
         return _ROLE_ALIASES[text]
     lowered = text.lower()
     return _ROLE_ALIASES.get(lowered)
+
+
+def _parse_json_object(value: Any) -> dict[str, Any] | None:
+    """Parse a frontend HITL payload without involving an LLM."""
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _is_allowed_uri(uri: str, allowed_roots: list[str]) -> bool:
@@ -114,16 +134,6 @@ def _is_allowed_uri(uri: str, allowed_roots: list[str]) -> bool:
         if value == normalized_root or value.startswith(f"{normalized_root}/"):
             return True
     return False
-
-
-def _normalize_system_name(value: str | None) -> str | None:
-    """Accept one literal root-folder name and reject path-like model output."""
-    name = (value or "").strip()
-    if not name or name in {".", ".."}:
-        return None
-    if any(separator in name for separator in ("/", "\\", ":")):
-        return None
-    return name
 
 
 def _iter_uri_items(value: Any) -> list[dict[str, Any]]:
@@ -139,6 +149,27 @@ def _iter_uri_items(value: Any) -> list[dict[str, Any]]:
         for nested in value:
             items.extend(_iter_uri_items(nested))
     return items
+
+
+def _root_system_candidates(value: Any) -> list[dict[str, str]]:
+    """Extract only verified direct child directories from a root listing."""
+    root_prefix = f"{ROOT_RESOURCES_URI}/"
+    candidates_by_uri: dict[str, dict[str, str]] = {}
+    for item in _iter_uri_items(value):
+        if item.get("isDir") is not True:
+            continue
+        uri = str(item["uri"]).rstrip("/")
+        if not uri.startswith(root_prefix):
+            continue
+        relative_path = uri.removeprefix(root_prefix)
+        if not relative_path or "/" in relative_path:
+            continue
+        candidates_by_uri[uri] = {
+            "name": relative_path,
+            "uri": uri,
+            "abstract": str(item.get("abstract") or "")[:500],
+        }
+    return list(candidates_by_uri.values())
 
 
 def _normalize_source_level(value: Any) -> SourceLevel | None:
@@ -182,17 +213,13 @@ def _merge_candidates(current: dict[str, Any], candidate: dict[str, Any]) -> dic
     """Merge duplicate URIs while retaining the strongest score and richest level."""
     current_score = current.get("score")
     candidate_score = candidate.get("score")
-    prefer_candidate = candidate_score is not None and (
-        current_score is None or candidate_score > current_score
-    )
+    prefer_candidate = candidate_score is not None and (current_score is None or candidate_score > current_score)
     merged = dict(candidate if prefer_candidate else current)
     levels = [current.get("source_level"), candidate.get("source_level")]
     merged["source_level"] = max(levels, key=_source_level_rank)
     merged["is_directory"] = bool(current.get("is_directory") or candidate.get("is_directory"))
     merged["task_ids"] = list(dict.fromkeys([*current["task_ids"], *candidate["task_ids"]]))
-    merged["operations"] = list(
-        dict.fromkeys([*current["operations"], *candidate["operations"]])
-    )
+    merged["operations"] = list(dict.fromkeys([*current["operations"], *candidate["operations"]]))
     return merged
 
 
@@ -280,6 +307,7 @@ class AgentLoop:
             {
                 "role_clarification": "role_clarification",
                 "system_scope_determination": "system_scope_determination",
+                "initial_find": "initial_find",
                 "direct_answer": "direct_answer",
             },
         )
@@ -288,6 +316,7 @@ class AgentLoop:
             self.route_after_role,
             {
                 "system_scope_determination": "system_scope_determination",
+                "initial_find": "initial_find",
                 "direct_answer": "direct_answer",
             },
         )
@@ -345,9 +374,11 @@ class AgentLoop:
             "entities": [],
             "constraints": [],
             "answer_requirements": [],
-            "allowed_target_uris": ["viking://resources"],
+            "allowed_target_uris": [ROOT_RESOURCES_URI],
             "system_name": "",
             "system_scope_explicit": False,
+            "system_options": [],
+            "scope_determination_completed": False,
             "hitl_retry_used": False,
             "retrieval_tasks": [],
             "executed_queries": [],
@@ -448,11 +479,11 @@ class AgentLoop:
         """Interrupt until the user selects one supported role."""
         prompt: dict[str, Any] = {
             "type": "role_clarification",
+            "input_type": "single_choice",
+            "field": "role",
+            "required": True,
             "question": "为了按合适的视角改写问题并检索知识库，请问您当前的角色是：产品经理、开发，还是新入职员工？",
-            "options": [
-                {"label": label, "value": value}
-                for value, label in _ROLE_LABELS.items()
-            ],
+            "options": [{"label": label, "value": value} for value, label in _ROLE_LABELS.items()],
         }
         role: str | None = None
         raw_answer: Any = None
@@ -469,35 +500,81 @@ class AgentLoop:
             "role_confidence": 1.0,
             "role_evidence": ["用户通过角色澄清确认"],
             "needs_role_clarification": False,
-            "route": "system_scope_determination" if state.needs_retrieval else "direct_answer",
+            "route": (
+                "initial_find"
+                if state.needs_retrieval and state.scope_determination_completed
+                else "system_scope_determination"
+                if state.needs_retrieval
+                else "direct_answer"
+            ),
         }
 
     async def system_scope_determination(self, state: GraphState) -> dict[str, Any]:
-        """Use the LLM to constrain retrieval to an explicitly named root system."""
+        """List real root systems and let the LLM select one verified candidate."""
+        try:
+            root_listing = await self.openviking_api.list_resources(
+                ROOT_RESOURCES_URI,
+                recursive=False,
+                node_limit=100,
+            )
+        except Exception:
+            logger.exception("openviking_system_scope_listing_failed")
+            return {
+                "allowed_target_uris": [ROOT_RESOURCES_URI],
+                "system_name": "",
+                "system_scope_explicit": False,
+                "system_options": [],
+                "scope_determination_completed": True,
+                "route": "initial_find",
+            }
+
+        candidates = _root_system_candidates(root_listing)
+        system_options = [{"label": candidate["name"], "value": candidate["uri"]} for candidate in candidates]
+        if not candidates:
+            logger.warning("openviking_system_scope_candidates_empty")
+            return {
+                "allowed_target_uris": [ROOT_RESOURCES_URI],
+                "system_name": "",
+                "system_scope_explicit": False,
+                "system_options": [],
+                "scope_determination_completed": True,
+                "route": "initial_find",
+            }
+
         scope = await self.llm_service.call(
             [
                 SystemMessage(content=get_agentic_rag_prompt("system_scope_determination")),
-                HumanMessage(content=_json({"query": state.normalized_query})),
+                HumanMessage(
+                    content=_json(
+                        {
+                            "query": state.user_query,
+                            "system_candidates": candidates,
+                        }
+                    )
+                ),
             ],
             response_format=SystemScopeResult,
         )
-        system_name = _normalize_system_name(scope.system_name) if scope.system_explicit else None
-        system_explicit = system_name is not None
-        root_uri = (
-            f"viking://resources/{system_name}"
-            if system_name is not None
-            else "viking://resources"
-        )
-        if scope.system_explicit and not system_explicit:
+        candidates_by_uri = {item["uri"]: item for item in candidates}
+        selected_uri = (scope.selected_uri or "").strip().rstrip("/")
+        selected_candidate = candidates_by_uri.get(selected_uri) if scope.scope_confident else None
+        if scope.scope_confident and selected_candidate is None:
             logger.warning(
                 "invalid_system_scope_ignored",
-                proposed_system_name=scope.system_name,
+                proposed_uri=scope.selected_uri,
+                candidate_count=len(candidates),
             )
         return {
-            "normalized_query": scope.scoped_query.strip(),
-            "allowed_target_uris": [root_uri],
-            "system_name": system_name or "",
-            "system_scope_explicit": system_explicit,
+            "normalized_query": (
+                scope.scoped_query.strip() if selected_candidate is not None else state.normalized_query
+            ),
+            "allowed_target_uris": [
+                selected_candidate["uri"] if selected_candidate is not None else ROOT_RESOURCES_URI
+            ],
+            "system_name": (selected_candidate["name"] if selected_candidate is not None else ""),
+            "system_scope_explicit": selected_candidate is not None,
+            "system_options": system_options,
+            "scope_determination_completed": True,
             "route": "initial_find",
         }
 
@@ -605,13 +682,7 @@ class AgentLoop:
             ],
             response_format=GrepKeywordResult,
         )
-        keywords = list(
-            dict.fromkeys(
-                keyword.strip()
-                for keyword in keyword_result.keywords
-                if keyword.strip()
-            )
-        )
+        keywords = list(dict.fromkeys(keyword.strip() for keyword in keyword_result.keywords if keyword.strip()))
         pattern = "|".join(re.escape(keyword) for keyword in keywords)
         task = RetrievalTask(
             task_id="grep_keywords",
@@ -675,11 +746,7 @@ class AgentLoop:
                     }
 
         raw_results = list(await asyncio.gather(*(execute(task) for task in tasks)))
-        queries = [
-            task.query
-            for task in tasks
-            if task.query and task.query not in state.executed_queries
-        ]
+        queries = [task.query for task in tasks if task.query and task.query not in state.executed_queries]
         operations = [
             {
                 "round": state.retrieval_round + 1,
@@ -747,8 +814,7 @@ class AgentLoop:
         """Read L0/L1 first and a bounded number of L2 documents."""
         semaphore = asyncio.Semaphore(MAX_PARALLEL_TASKS)
         task_by_id = {
-            task.task_id: task
-            for task in (RetrievalTask.model_validate(item) for item in state.retrieval_tasks)
+            task.task_id: task for task in (RetrievalTask.model_validate(item) for item in state.retrieval_tasks)
         }
 
         async def hydrate(index: int, candidate: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -797,11 +863,7 @@ class AgentLoop:
                         }
                     )
                     wants_full = task is not None and task.hydration_level == "full"
-                    if (
-                        first_level != "full"
-                        and wants_full
-                        and index < MAX_FULL_CONTENT_RESOURCES
-                    ):
+                    if first_level != "full" and wants_full and index < MAX_FULL_CONTENT_RESOURCES:
                         full_content = await self.openviking_api.read(uri, "full")
                         evidence.append(
                             {
@@ -828,15 +890,12 @@ class AgentLoop:
             return evidence, errors
 
         hydrated = list(
-            await asyncio.gather(
-                *(hydrate(index, candidate) for index, candidate in enumerate(state.candidate_items))
-            )
+            await asyncio.gather(*(hydrate(index, candidate) for index, candidate in enumerate(state.candidate_items)))
         )
         new_evidence = [item for group, _ in hydrated for item in group]
         errors = [item for _, group in hydrated for item in group]
         evidence_by_key = {
-            (item.get("uri"), item.get("level")): item
-            for item in [*state.selected_evidence, *new_evidence]
+            (item.get("uri"), item.get("level")): item for item in [*state.selected_evidence, *new_evidence]
         }
         evidence = list(evidence_by_key.values())
         return {
@@ -932,36 +991,74 @@ class AgentLoop:
                 "现有问题和知识库证据仍不足。请声明需要查询哪个系统的知识库，"
                 "并明确具体问题、对象、版本、场景或期望结果。"
             )
+        requires_system = not state.system_scope_explicit and bool(state.system_options)
         prompt: dict[str, Any] = {
             "type": "question_clarification",
+            "input_type": "system_and_question",
             "question": question,
             "original_query": state.user_query,
             "current_system": state.system_name or None,
-            "requires_system_name": not state.system_scope_explicit,
+            "requires_system": requires_system,
+            "system_field": "system_uri",
+            "question_field": "question",
+            "system_options": state.system_options,
             "missing_information": missing_descriptions,
         }
         supplement = ""
+        selected_uri = (
+            state.allowed_target_uris[0] if state.system_scope_explicit and state.allowed_target_uris else ""
+        )
+        selected_system_name = state.system_name
+        options_by_uri = {
+            str(option.get("value", "")).rstrip("/"): option for option in state.system_options if option.get("value")
+        }
         while not supplement:
             raw_answer = interrupt(prompt)
-            if isinstance(raw_answer, dict):
-                raw_answer = (
-                    raw_answer.get("answer")
-                    or raw_answer.get("content")
-                    or raw_answer.get("value")
-                    or ""
-                )
-            supplement = str(raw_answer).strip()
-            if not supplement:
-                prompt = {**prompt, "error": "补充信息不能为空。"}
+            payload = _parse_json_object(raw_answer)
+            submitted_uri = ""
+            if payload is not None:
+                submitted_uri = str(payload.get("system_uri") or "").strip().rstrip("/")
+                supplement = str(
+                    payload.get("question") or payload.get("answer") or payload.get("content") or ""
+                ).strip()
+            elif not requires_system:
+                supplement = str(raw_answer).strip()
 
-        combined_query = f"{state.user_query}\n用户补充：{supplement}".strip()
+            if submitted_uri:
+                selected_option = options_by_uri.get(submitted_uri)
+                if selected_option is None:
+                    supplement = ""
+                    prompt = {**prompt, "error": "请选择 system_options 中提供的系统。"}
+                    continue
+                selected_uri = submitted_uri
+                selected_system_name = str(selected_option.get("label") or "")
+            elif requires_system:
+                supplement = ""
+                prompt = {
+                    **prompt,
+                    "error": "请选择 system_options 中的系统，并补充具体问题。",
+                }
+                continue
+
+            if not supplement:
+                prompt = {**prompt, "error": "补充问题不能为空。"}
+
+        system_context = f"用户选择系统：{selected_system_name}\n" if selected_system_name else ""
+        combined_query = (f"{state.user_query}\n{system_context}用户补充：{supplement}").strip()
+        selected_scope_explicit = bool(selected_uri and selected_system_name)
         return {
-            "messages": [HumanMessage(content=f"补充信息：{supplement}")],
+            "messages": [
+                HumanMessage(
+                    content=(f"选择系统：{selected_system_name}\n" if selected_system_name else "")
+                    + f"补充信息：{supplement}"
+                )
+            ],
             "user_query": combined_query,
             "normalized_query": combined_query,
-            "allowed_target_uris": ["viking://resources"],
-            "system_name": "",
-            "system_scope_explicit": False,
+            "allowed_target_uris": [selected_uri if selected_scope_explicit else ROOT_RESOURCES_URI],
+            "system_name": selected_system_name if selected_scope_explicit else "",
+            "system_scope_explicit": selected_scope_explicit,
+            "scope_determination_completed": True,
             "hitl_retry_used": True,
             "retrieval_tasks": [],
             "executed_queries": [],
@@ -1051,30 +1148,19 @@ class AgentLoop:
         )
 
         has_valid_citation = not available_uris or any(uri in state.draft_answer for uri in available_uris)
-        missing_required_ids = [
-            item for item in assessment.missing_required_ids if item in required_id_set
-        ]
-        missing_optional_ids = [
-            item for item in assessment.missing_optional_ids if item in optional_id_set
-        ]
+        missing_required_ids = [item for item in assessment.missing_required_ids if item in required_id_set]
+        missing_optional_ids = [item for item in assessment.missing_optional_ids if item in optional_id_set]
         has_required_gap = bool(missing_required_ids)
         if assessment.passed and assessment.action == "pass" and has_valid_citation and not has_required_gap:
             route = "finalizer"
-        elif (
-            has_required_gap
-            and assessment.action == "retrieve"
-        ):
+        elif has_required_gap and assessment.action == "retrieve":
             route = _next_retrieval_route(state.retrieval_stage, state.hitl_retry_used)
         elif state.revision_count < 1:
             route = "answer_generator"
         elif not has_required_gap and not assessment.unsupported_claims:
             route = "finalizer"
         else:
-            route = (
-                "knowledge_not_found"
-                if state.hitl_retry_used
-                else "question_clarification"
-            )
+            route = "knowledge_not_found" if state.hitl_retry_used else "question_clarification"
 
         instructions = assessment.revision_instructions
         if not has_valid_citation:
@@ -1088,16 +1174,41 @@ class AgentLoop:
         }
 
     async def finalizer(self, state: GraphState) -> dict[str, Any]:
-        """Publish the verified answer."""
+        """Generate and publish the verified final answer as model token chunks."""
+        writer = get_stream_writer()
+        chunks: list[str] = []
+        async for chunk in self.llm_service.stream(
+            [
+                SystemMessage(content=get_agentic_rag_prompt("final_answer_generator")),
+                HumanMessage(
+                    content=_json(
+                        {
+                            "query": state.normalized_query,
+                            "verified_draft": state.draft_answer,
+                            "evidence": state.selected_evidence,
+                        },
+                        max_chars=MAX_EVIDENCE_CHARS,
+                    )
+                ),
+            ]
+        ):
+            chunks.append(chunk)
+            writer({"type": "final_answer_chunk", "content": chunk})
+        final_answer = "".join(chunks).strip()
+        if not final_answer:
+            final_answer = state.draft_answer
+            writer({"type": "final_answer_chunk", "content": final_answer})
         return {
-            "final_answer": state.draft_answer,
-            "messages": [AIMessage(content=state.draft_answer)],
+            "final_answer": final_answer,
+            "messages": [AIMessage(content=final_answer)],
             "route": "completed",
         }
 
     async def direct_answer(self, state: GraphState) -> dict[str, Any]:
-        """Answer conversational requests without pretending to retrieve."""
-        response = await self.llm_service.call(
+        """Stream a conversational answer without pretending to retrieve."""
+        writer = get_stream_writer()
+        chunks: list[str] = []
+        async for chunk in self.llm_service.stream(
             [
                 SystemMessage(content=get_agentic_rag_prompt("direct_answer")),
                 HumanMessage(
@@ -1110,8 +1221,12 @@ class AgentLoop:
                     )
                 ),
             ]
-        )
-        answer = _message_text(response).strip()
+        ):
+            chunks.append(chunk)
+            writer({"type": "final_answer_chunk", "content": chunk})
+        answer = "".join(chunks).strip()
+        if not answer:
+            raise RuntimeError("直接回答模型未返回内容")
         return {
             "draft_answer": answer,
             "final_answer": answer,
@@ -1122,18 +1237,27 @@ class AgentLoop:
     @staticmethod
     def route_after_intent(
         state: GraphState,
-    ) -> Literal["role_clarification", "system_scope_determination", "direct_answer"]:
+    ) -> Literal[
+        "role_clarification",
+        "system_scope_determination",
+        "initial_find",
+        "direct_answer",
+    ]:
         """Route after intent and role analysis."""
         if state.needs_role_clarification:
             return "role_clarification"
-        return "system_scope_determination" if state.needs_retrieval else "direct_answer"
+        if not state.needs_retrieval:
+            return "direct_answer"
+        return "initial_find" if state.scope_determination_completed else "system_scope_determination"
 
     @staticmethod
     def route_after_role(
         state: GraphState,
-    ) -> Literal["system_scope_determination", "direct_answer"]:
+    ) -> Literal["system_scope_determination", "initial_find", "direct_answer"]:
         """Continue the original request after HITL role confirmation."""
-        return "system_scope_determination" if state.needs_retrieval else "direct_answer"
+        if not state.needs_retrieval:
+            return "direct_answer"
+        return "initial_find" if state.scope_determination_completed else "system_scope_determination"
 
     @staticmethod
     def route_after_evidence(

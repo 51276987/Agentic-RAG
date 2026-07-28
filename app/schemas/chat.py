@@ -77,15 +77,47 @@ class ChatResponse(BaseResponse):
     messages: List[Message] = Field(..., description="List of messages in the conversation")
 
 
+class StreamDirectory(BaseModel):
+    """A frontend-selectable OpenViking knowledge directory."""
+
+    title: str = Field(..., description="Directory title shown to the user")
+    uri: str = Field(..., description="Exact directory URI submitted on HITL resume")
+
+
+class StreamOption(BaseModel):
+    """A generic frontend-selectable HITL option."""
+
+    title: str = Field(..., description="Option title shown to the user")
+    value: str = Field(..., description="Fixed value submitted on HITL resume")
+
+
 class StreamResponse(BaseResponse):
     """Response model for streaming chat endpoint.
 
     Attributes:
-        content: The content of the current chunk.
+        event: The frontend-dispatchable stream event type.
+        content: The content of a normal answer chunk.
         done: Whether the stream is complete.
     """
 
+    event: Literal["message", "hitl", "done", "error"] = Field(
+        default="message",
+        description="Frontend-dispatchable event type",
+    )
     content: str = Field(default="", description="The content of the current chunk")
+    hitl_type: Literal["question_clarification", "role_clarification"] | None = Field(
+        default=None,
+        description="HITL workflow type when event is hitl",
+    )
+    title: str | None = Field(default=None, description="HITL title shown to the user")
+    directories: list[StreamDirectory] | None = Field(
+        default=None,
+        description="Knowledge directories available for query clarification",
+    )
+    options: list[StreamOption] | None = Field(
+        default=None,
+        description="Fixed options available for a generic HITL selection",
+    )
     done: bool = Field(default=False, description="Whether the stream is complete")
 
 
