@@ -72,6 +72,7 @@ services:
     restart: on-failure
     networks:
       - monitoring
+      - observability
 
   # Prometheus
   prometheus:
@@ -119,6 +120,9 @@ services:
 networks:
   monitoring:
     driver: bridge
+  observability:
+    external: true
+    name: observability
 
 volumes:
   grafana-storage:

@@ -86,6 +86,20 @@ def _trace_metadata(
     return metadata
 
 
+def _get_stream_fallback_answer(
+    state_values: dict[str, object],
+    *,
+    output_emitted: bool,
+) -> str | None:
+    """Return a completed final answer only when no stream output was emitted."""
+    if output_emitted:
+        return None
+    final_answer = state_values.get("final_answer")
+    if not isinstance(final_answer, str) or not final_answer.strip():
+        return None
+    return final_answer
+
+
 class LangGraphAgent:
     """Manages the LangGraph Agent/workflow and interactions with the LLM.
 
@@ -301,6 +315,7 @@ class LangGraphAgent:
         graph = await self._get_graph()
 
         try:
+            output_emitted = False
             # Run state check and memory search concurrently to save 200-500ms
             state, relevant_memory = await asyncio.gather(
                 graph.aget_state(config),
@@ -326,6 +341,7 @@ class LangGraphAgent:
                         and isinstance(update.get("content"), str)
                         and update["content"]
                     ):
+                        output_emitted = True
                         yield update["content"]
                     continue
                 if stream_mode != "updates":
@@ -340,6 +356,7 @@ class LangGraphAgent:
                         if isinstance(message, AIMessage):
                             text = extract_text_content(message.content)
                             if text:
+                                output_emitted = True
                                 yield text
 
             # After streaming completes, check for interrupt or update memory
@@ -349,6 +366,24 @@ class LangGraphAgent:
                 logger.info("graph_interrupted_stream", session_id=session_id, interrupt_value=str(interrupt_value))
                 yield self._format_interrupt(interrupt_value)
             elif state.values and "messages" in state.values:
+                fallback_answer = _get_stream_fallback_answer(
+                    state.values,
+                    output_emitted=output_emitted,
+                )
+                if fallback_answer is not None:
+                    logger.warning(
+                        "stream_final_answer_fallback_used",
+                        session_id=session_id,
+                        route=state.values.get("route"),
+                    )
+                    yield fallback_answer
+                elif not output_emitted:
+                    logger.error(
+                        "stream_completed_without_output",
+                        session_id=session_id,
+                        route=state.values.get("route"),
+                    )
+                    raise RuntimeError("请求已完成，但未生成可返回内容")
                 openai_msgs = cast(list[dict], convert_to_openai_messages(state.values["messages"]))
                 asyncio.create_task(memory_service.add(user_id, openai_msgs, config.get("metadata")))
         except GraphInterrupt:
