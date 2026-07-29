@@ -54,6 +54,17 @@ class Message(BaseModel):
         return v
 
 
+class ChatHistoryMessage(Message):
+    """A persisted chat message returned by the history and chat APIs.
+
+    Input messages intentionally have a small size limit. Persisted assistant
+    responses can legitimately be much longer, so they must not reuse that
+    request-validation limit when being read from a LangGraph checkpoint.
+    """
+
+    content: str = Field(..., description="The complete persisted message content", min_length=1)
+
+
 class ChatRequest(BaseModel):
     """Request model for chat endpoint.
 
@@ -75,7 +86,7 @@ class ChatResponse(BaseResponse):
         messages: List of messages in the conversation.
     """
 
-    messages: List[Message] = Field(..., description="List of messages in the conversation")
+    messages: List[ChatHistoryMessage] = Field(..., description="List of messages in the conversation")
 
 
 class StreamDirectory(BaseModel):

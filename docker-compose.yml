@@ -40,6 +40,7 @@ services:
 
   # Single API service with dynamic environment
   app:
+    image: ${APP_IMAGE:-fastapi-langgraph-agent-production-ready-template-app:latest}
     build:
       context: .
       args:

@@ -12,7 +12,8 @@ ENV APP_ENV=${APP_ENV} \
     PYTHONHASHSEED=random \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=on \
-    PIP_DEFAULT_TIMEOUT=100
+    PIP_DEFAULT_TIMEOUT=100 \
+    TIKTOKEN_CACHE_DIR=/app/.cache/tiktoken
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -29,6 +30,11 @@ RUN uv sync --frozen --no-install-project
 # Copy the application and install the project itself against the locked deps
 COPY . .
 RUN uv sync --frozen
+
+# Bake the tokenizer encoding into the image.  This prevents a Qwen-backed
+# deployment from downloading it at runtime on a server without public access.
+RUN mkdir -p "${TIKTOKEN_CACHE_DIR}" \
+    && /app/.venv/bin/python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')"
 
 # Make entrypoint script executable - do this before changing user
 RUN chmod +x /app/scripts/docker-entrypoint.sh

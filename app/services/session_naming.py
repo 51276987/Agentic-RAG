@@ -10,6 +10,7 @@ On the first message of a new session this module:
 """
 
 import asyncio
+from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from sqlmodel import (
@@ -37,6 +38,23 @@ def _build_placeholder(user_message: str) -> str:
     return cleaned[:_PLACEHOLDER_MAX].rstrip() or "New chat"
 
 
+def _title_from_response_content(content: Any) -> SessionTitle:
+    """Normalize the plain-text title returned by an OpenAI-compatible model."""
+    if isinstance(content, str):
+        raw_title = content
+    elif isinstance(content, list):
+        raw_title = " ".join(
+            str(item.get("text", ""))
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "text"
+        )
+    else:
+        raw_title = str(content or "")
+
+    normalized = " ".join(raw_title.split())[:60]
+    return SessionTitle(title=normalized)
+
+
 def _claim_session(session_id: str, placeholder: str) -> bool:
     """Return True iff this caller wins the atomic Postgres claim.
 
@@ -62,13 +80,13 @@ async def _persist_session_name(session_id: str, user_message: str) -> None:
                 HumanMessage(content=user_message[:500]),
             ],
             model_name=settings.DEFAULT_LLM_MODEL,
-            response_format=SessionTitle,
             max_tokens=32,
             temperature=0.3,
         )
-        await database_service.update_session_name(session_id, result.title)
+        title = _title_from_response_content(result.content)
+        await database_service.update_session_name(session_id, title.title)
         session_names_generated_total.labels(status="success").inc()
-        logger.info("session_name_generated", session_id=session_id, name=result.title)
+        logger.info("session_name_generated", session_id=session_id, name=title.title)
     except Exception:
         session_names_generated_total.labels(status="error").inc()
         logger.exception("session_name_generation_failed", session_id=session_id)

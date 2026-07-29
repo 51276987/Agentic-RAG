@@ -44,6 +44,7 @@ from app.core.langgraph.agent_loop import AgentLoop
 from app.core.logging import logger
 from app.core.observability import get_langfuse_callback_handler
 from app.schemas import (
+    ChatHistoryMessage,
     GraphState,
     Message,
 )
@@ -221,7 +222,7 @@ class LangGraphAgent:
         session_id: str,
         user_id: Optional[str] = None,
         username: Optional[str] = None,
-    ) -> list[Message]:
+    ) -> list[ChatHistoryMessage]:
         """Get a response from the LLM.
 
         Args:
@@ -270,7 +271,7 @@ class LangGraphAgent:
             if state.next:
                 interrupt_value = state.tasks[0].interrupts[0].value if state.tasks else "Waiting for input."
                 logger.info("graph_interrupted", session_id=session_id, interrupt_value=str(interrupt_value))
-                return [Message(role="assistant", content=self._format_interrupt(interrupt_value))]
+                return [ChatHistoryMessage(role="assistant", content=self._format_interrupt(interrupt_value))]
 
             openai_msgs = cast(list[dict], convert_to_openai_messages(response["messages"]))
             asyncio.create_task(memory_service.add(user_id, openai_msgs, config.get("metadata")))
@@ -279,7 +280,7 @@ class LangGraphAgent:
             state = await graph.aget_state(config)
             interrupt_value = state.tasks[0].interrupts[0].value if state.tasks else "Waiting for input."
             logger.info("graph_interrupted", session_id=session_id, interrupt_value=str(interrupt_value))
-            return [Message(role="assistant", content=self._format_interrupt(interrupt_value))]
+            return [ChatHistoryMessage(role="assistant", content=self._format_interrupt(interrupt_value))]
         except Exception as e:
             logger.exception("get_response_failed", error=str(e), session_id=session_id)
             raise
@@ -400,14 +401,14 @@ class LangGraphAgent:
             logger.exception("stream_processing_failed", error=str(stream_error), session_id=session_id)
             raise stream_error
 
-    async def get_chat_history(self, session_id: str) -> list[Message]:
+    async def get_chat_history(self, session_id: str) -> list[ChatHistoryMessage]:
         """Get the chat history for a given thread ID.
 
         Args:
             session_id (str): The session ID for the conversation.
 
         Returns:
-            list[Message]: The chat history.
+            list[ChatHistoryMessage]: The chat history.
         """
         graph = await self._get_graph()
 
@@ -419,11 +420,11 @@ class LangGraphAgent:
         state: StateSnapshot = await graph.aget_state(config=config)
         return self.__process_messages(state.values["messages"]) if state.values else []
 
-    def __process_messages(self, messages: list[BaseMessage]) -> list[Message]:
+    def __process_messages(self, messages: list[BaseMessage]) -> list[ChatHistoryMessage]:
         openai_style_messages = convert_to_openai_messages(messages)
         # keep just assistant and user messages
         return [
-            Message(role=message["role"], content=str(message["content"]))
+            ChatHistoryMessage(role=message["role"], content=str(message["content"]))
             for message in openai_style_messages
             if message["role"] in ["assistant", "user"] and message["content"]
         ]

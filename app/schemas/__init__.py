@@ -14,6 +14,7 @@ from app.schemas.agentic_rag import (
 )
 from app.schemas.base import BaseResponse
 from app.schemas.chat import (
+    ChatHistoryMessage,
     ChatRequest,
     ChatResponse,
     Message,
@@ -33,6 +34,7 @@ __all__ = [
     "EvidenceAssessment",
     "GroundednessAssessment",
     "BaseResponse",
+    "ChatHistoryMessage",
     "ChatRequest",
     "ChatResponse",
     "Message",
