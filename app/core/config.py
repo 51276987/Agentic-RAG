@@ -152,7 +152,10 @@ class Settings:
         self.FALLBACK_LLM_MODELS = parse_list_from_env("FALLBACK_LLM_MODELS")
         self.SESSION_NAMING_ENABLED = os.getenv("SESSION_NAMING_ENABLED", "true").lower() == "true"
         self.DEFAULT_LLM_TEMPERATURE = float(os.getenv("DEFAULT_LLM_TEMPERATURE", "0.2"))
-        self.MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2000"))
+        # Shared generation cap for the draft and streamed final answer.  A
+        # 2k-token ceiling truncates evidence-backed answers before the SSE
+        # layer can emit their final section.
+        self.MAX_TOKENS = int(os.getenv("MAX_TOKENS", "8192"))
         self.MAX_LLM_CALL_RETRIES = int(os.getenv("MAX_LLM_CALL_RETRIES", "3"))
         self.LLM_TOTAL_TIMEOUT = int(os.getenv("LLM_TOTAL_TIMEOUT", "60"))
 

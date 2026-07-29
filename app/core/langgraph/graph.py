@@ -343,6 +343,11 @@ class LangGraphAgent:
                     ):
                         output_emitted = True
                         yield update["content"]
+                    elif isinstance(update, dict) and update.get("type") == "tool_progress":
+                        # Forward graph-node and OpenViking progress as a
+                        # structured chunk.  The API layer promotes it to a
+                        # frontend-facing `tool:` SSE event.
+                        yield json.dumps(update, ensure_ascii=False, default=str)
                     continue
                 if stream_mode != "updates":
                     continue

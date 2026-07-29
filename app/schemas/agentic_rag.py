@@ -17,6 +17,7 @@ RetrievalOperation = Literal["find", "grep"]
 HydrationLevel = Literal["abstract", "overview", "full"]
 RequirementPriority = Literal["required", "optional"]
 RequirementEvidenceSource = Literal["knowledge_base", "user_context", "knowledge_and_context"]
+MAX_REQUIRED_ANSWER_REQUIREMENTS = 1
 
 
 class AnswerRequirement(BaseModel):
@@ -51,12 +52,26 @@ class IntentAnalysis(BaseModel):
 
     @model_validator(mode="after")
     def validate_answer_requirements(self) -> Self:
-        """Require stable unique IDs and at least one required obligation."""
+        """Keep exactly one user-requested obligation as the retrieval gate."""
         requirement_ids = [item.requirement_id for item in self.answer_requirements]
         if len(requirement_ids) != len(set(requirement_ids)):
             raise ValueError("answer requirement IDs must be unique")
         if not any(item.priority == "required" for item in self.answer_requirements):
             raise ValueError("at least one answer requirement must be required")
+
+        # The evidence grader only blocks on required requirements.  Letting an
+        # LLM split one question into multiple required items turns helpful
+        # detail into a hard retrieval gate and causes unnecessary repair/HITL
+        # loops.  The prompt asks the model to make the first required item a
+        # single, complete statement of the user's explicit request; this is a
+        # defensive invariant for malformed or legacy model output.
+        required_seen = 0
+        for requirement in self.answer_requirements:
+            if requirement.priority != "required":
+                continue
+            required_seen += 1
+            if required_seen > MAX_REQUIRED_ANSWER_REQUIREMENTS:
+                requirement.priority = "optional"
         return self
 
 

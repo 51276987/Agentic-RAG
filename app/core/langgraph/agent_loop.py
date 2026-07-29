@@ -3,6 +3,7 @@
 import asyncio
 import json
 import re
+from collections.abc import Awaitable, Callable
 from typing import (
     Any,
     Literal,
@@ -20,6 +21,7 @@ from langgraph.graph import (
     StateGraph,
 )
 from langgraph.config import get_stream_writer
+from langgraph.errors import GraphInterrupt
 from langgraph.types import interrupt
 
 from app.core.logging import logger
@@ -44,6 +46,7 @@ MAX_RESULTS_PER_TASK = 10
 MAX_HYDRATED_RESOURCES = 8
 MAX_FULL_CONTENT_RESOURCES = 4
 MAX_EVIDENCE_CHARS = 24_000
+MAX_TOOL_RESULT_DOCUMENTS = 10
 ROOT_RESOURCES_URI = "viking://resources"
 SourceLevel = Literal["abstract", "overview", "full"]
 
@@ -63,6 +66,28 @@ _ROLE_ALIASES = {
     "新入职员工": "new_employee",
     "新员工": "new_employee",
 }
+
+_NODE_TITLES = {
+    "prepare_request": "整理当前问题",
+    "intent_analyzer": "分析问题意图",
+    "role_clarification": "确认用户角色",
+    "system_scope_determination": "确定知识库系统范围",
+    "initial_find": "准备首次知识库检索",
+    "query_rewrite": "改写检索问题",
+    "grep_query_builder": "生成关键词检索条件",
+    "retrieval_executor": "执行知识库检索",
+    "result_fusion": "融合检索结果",
+    "evidence_hydration": "补全证据内容",
+    "evidence_grader": "评估证据覆盖情况",
+    "question_clarification": "请求补充查询信息",
+    "knowledge_not_found": "生成未检索到结果说明",
+    "answer_generator": "生成答案草稿",
+    "groundedness_verifier": "校验答案依据",
+    "finalizer": "生成最终回答",
+    "direct_answer": "生成直接回答",
+}
+
+NodeHandler = Callable[[GraphState], Awaitable[dict[str, Any]]]
 
 
 def _json(value: Any, *, max_chars: int | None = None) -> str:
@@ -149,6 +174,31 @@ def _iter_uri_items(value: Any) -> list[dict[str, Any]]:
         for nested in value:
             items.extend(_iter_uri_items(nested))
     return items
+
+
+def _tool_result_documents(value: Any) -> list[dict[str, Any]]:
+    """Return a compact, deduplicated document list safe for SSE metadata."""
+    documents: list[dict[str, Any]] = []
+    seen_uris: set[str] = set()
+    for item in _iter_uri_items(value):
+        uri = str(item["uri"])
+        if not uri or uri in seen_uris:
+            continue
+        seen_uris.add(uri)
+        document: dict[str, Any] = {"uri": uri}
+        if "level" in item:
+            document["level"] = item["level"]
+        score = _numeric_score(item)
+        if score is not None:
+            document["score"] = score
+        if isinstance(item.get("line"), int):
+            document["line"] = item["line"]
+        if item.get("isDir") is True:
+            document["is_directory"] = True
+        documents.append(document)
+        if len(documents) >= MAX_TOOL_RESULT_DOCUMENTS:
+            break
+    return documents
 
 
 def _root_system_candidates(value: Any) -> list[dict[str, str]]:
@@ -245,12 +295,23 @@ def _parse_answer_requirements(items: list[dict[str, Any] | str]) -> list[Answer
                 AnswerRequirement(
                     requirement_id=f"req_{index}",
                     description=item,
-                    priority="required",
+                    priority="required" if not requirements else "optional",
                     evidence_source="knowledge_base",
                 )
             )
             continue
         requirements.append(AnswerRequirement.model_validate(item))
+
+    # Old checkpoints can contain multiple string-only requirements.  Preserve
+    # their content but do not let legacy detail become a multi-item retrieval
+    # gate after upgrading the workflow.
+    required_seen = 0
+    for requirement in requirements:
+        if requirement.priority != "required":
+            continue
+        required_seen += 1
+        if required_seen > 1:
+            requirement.priority = "optional"
     return requirements
 
 
@@ -279,25 +340,98 @@ class AgentLoop:
         self.llm_service = llm_service
         self.openviking_api = openviking_api
 
+    @staticmethod
+    def _emit_tool_progress(
+        tool_name: str,
+        tool_kind: Literal["node", "openviking"],
+        tool_status: Literal["started", "completed", "failed"],
+        title: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Publish small, frontend-safe progress events in stream mode."""
+        try:
+            writer = get_stream_writer()
+        except RuntimeError:
+            # Nodes are also invoked directly by unit tests and maintenance
+            # code, where no LangGraph stream context exists.
+            return
+        writer(
+            {
+                "type": "tool_progress",
+                "tool_name": tool_name,
+                "tool_kind": tool_kind,
+                "tool_status": tool_status,
+                "title": title,
+                "metadata": metadata or {},
+            }
+        )
+
+    def _with_node_progress(self, node_name: str, handler: NodeHandler) -> NodeHandler:
+        """Wrap every graph node with start/completion progress notifications."""
+
+        async def wrapped(state: GraphState) -> dict[str, Any]:
+            title = _NODE_TITLES[node_name]
+            self._emit_tool_progress(
+                tool_name=f"node.{node_name}",
+                tool_kind="node",
+                tool_status="started",
+                title=title,
+                metadata={"node": node_name},
+            )
+            try:
+                result = await handler(state)
+            except GraphInterrupt:
+                # Dynamic interrupts are an expected pause, not a failed node.
+                # Let LangGraph persist and surface the pending interrupt.
+                raise
+            except Exception as exc:
+                self._emit_tool_progress(
+                    tool_name=f"node.{node_name}",
+                    tool_kind="node",
+                    tool_status="failed",
+                    title=title,
+                    metadata={"node": node_name, "error_type": type(exc).__name__},
+                )
+                raise
+            self._emit_tool_progress(
+                tool_name=f"node.{node_name}",
+                tool_kind="node",
+                tool_status="completed",
+                title=title,
+                metadata={"node": node_name},
+            )
+            return result
+
+        return wrapped
+
     def configure(self, graph: StateGraph) -> None:
         """Register nodes and routes on a StateGraph."""
-        graph.add_node("prepare_request", self.prepare_request)
-        graph.add_node("intent_analyzer", self.intent_analyzer)
-        graph.add_node("role_clarification", self.role_clarification)
-        graph.add_node("system_scope_determination", self.system_scope_determination)
-        graph.add_node("initial_find", self.initial_find)
-        graph.add_node("query_rewrite", self.query_rewrite)
-        graph.add_node("grep_query_builder", self.grep_query_builder)
-        graph.add_node("retrieval_executor", self.retrieval_executor)
-        graph.add_node("result_fusion", self.result_fusion)
-        graph.add_node("evidence_hydration", self.evidence_hydration)
-        graph.add_node("evidence_grader", self.evidence_grader)
-        graph.add_node("question_clarification", self.question_clarification)
-        graph.add_node("knowledge_not_found", self.knowledge_not_found)
-        graph.add_node("answer_generator", self.answer_generator)
-        graph.add_node("groundedness_verifier", self.groundedness_verifier)
-        graph.add_node("finalizer", self.finalizer)
-        graph.add_node("direct_answer", self.direct_answer)
+        graph.add_node("prepare_request", self._with_node_progress("prepare_request", self.prepare_request))
+        graph.add_node("intent_analyzer", self._with_node_progress("intent_analyzer", self.intent_analyzer))
+        graph.add_node("role_clarification", self._with_node_progress("role_clarification", self.role_clarification))
+        graph.add_node(
+            "system_scope_determination",
+            self._with_node_progress("system_scope_determination", self.system_scope_determination),
+        )
+        graph.add_node("initial_find", self._with_node_progress("initial_find", self.initial_find))
+        graph.add_node("query_rewrite", self._with_node_progress("query_rewrite", self.query_rewrite))
+        graph.add_node("grep_query_builder", self._with_node_progress("grep_query_builder", self.grep_query_builder))
+        graph.add_node("retrieval_executor", self._with_node_progress("retrieval_executor", self.retrieval_executor))
+        graph.add_node("result_fusion", self._with_node_progress("result_fusion", self.result_fusion))
+        graph.add_node("evidence_hydration", self._with_node_progress("evidence_hydration", self.evidence_hydration))
+        graph.add_node("evidence_grader", self._with_node_progress("evidence_grader", self.evidence_grader))
+        graph.add_node(
+            "question_clarification",
+            self._with_node_progress("question_clarification", self.question_clarification),
+        )
+        graph.add_node("knowledge_not_found", self._with_node_progress("knowledge_not_found", self.knowledge_not_found))
+        graph.add_node("answer_generator", self._with_node_progress("answer_generator", self.answer_generator))
+        graph.add_node(
+            "groundedness_verifier",
+            self._with_node_progress("groundedness_verifier", self.groundedness_verifier),
+        )
+        graph.add_node("finalizer", self._with_node_progress("finalizer", self.finalizer))
+        graph.add_node("direct_answer", self._with_node_progress("direct_answer", self.direct_answer))
 
         graph.add_edge(START, "prepare_request")
         graph.add_edge("prepare_request", "intent_analyzer")
@@ -511,13 +645,27 @@ class AgentLoop:
 
     async def system_scope_determination(self, state: GraphState) -> dict[str, Any]:
         """List real root systems and let the LLM select one verified candidate."""
+        self._emit_tool_progress(
+            tool_name="openviking.list_resources",
+            tool_kind="openviking",
+            tool_status="started",
+            title="读取知识库系统目录",
+            metadata={"target_uri": ROOT_RESOURCES_URI, "recursive": False},
+        )
         try:
             root_listing = await self.openviking_api.list_resources(
                 ROOT_RESOURCES_URI,
                 recursive=False,
                 node_limit=100,
             )
-        except Exception:
+        except Exception as exc:
+            self._emit_tool_progress(
+                tool_name="openviking.list_resources",
+                tool_kind="openviking",
+                tool_status="failed",
+                title="读取知识库系统目录失败",
+                metadata={"target_uri": ROOT_RESOURCES_URI, "error_type": type(exc).__name__},
+            )
             logger.exception("openviking_system_scope_listing_failed")
             return {
                 "allowed_target_uris": [ROOT_RESOURCES_URI],
@@ -529,6 +677,20 @@ class AgentLoop:
             }
 
         candidates = _root_system_candidates(root_listing)
+        self._emit_tool_progress(
+            tool_name="openviking.list_resources",
+            tool_kind="openviking",
+            tool_status="completed",
+            title="已读取知识库系统目录",
+            metadata={
+                "target_uri": ROOT_RESOURCES_URI,
+                "result_count": len(candidates),
+                "documents": [
+                    {"uri": candidate["uri"], "name": candidate["name"], "is_directory": True}
+                    for candidate in candidates[:MAX_TOOL_RESULT_DOCUMENTS]
+                ],
+            },
+        )
         system_options = [{"label": candidate["name"], "value": candidate["uri"]} for candidate in candidates]
         if not candidates:
             logger.warning("openviking_system_scope_candidates_empty")
@@ -711,6 +873,18 @@ class AgentLoop:
 
         async def execute(task: RetrievalTask) -> dict[str, Any]:
             async with semaphore:
+                operation_name = f"openviking.{task.operation}"
+                self._emit_tool_progress(
+                    tool_name=operation_name,
+                    tool_kind="openviking",
+                    tool_status="started",
+                    title=f"正在执行知识库 {task.operation} 检索",
+                    metadata={
+                        "task_id": task.task_id,
+                        "query": task.query[:500],
+                        "target_uri": task.target_uri,
+                    },
+                )
                 try:
                     if task.operation == "find":
                         result = await self.openviking_api.find(task.query, task.target_uri, task.limit)
@@ -722,6 +896,19 @@ class AgentLoop:
                             node_limit=task.node_limit,
                             level_limit=10,
                         )
+                    self._emit_tool_progress(
+                        tool_name=operation_name,
+                        tool_kind="openviking",
+                        tool_status="completed",
+                        title=f"知识库 {task.operation} 检索完成",
+                        metadata={
+                            "task_id": task.task_id,
+                            "query": task.query[:500],
+                            "target_uri": task.target_uri,
+                            "result_count": len(_iter_uri_items(result)),
+                            "documents": _tool_result_documents(result),
+                        },
+                    )
                     return {
                         "ok": True,
                         "task_id": task.task_id,
@@ -730,6 +917,18 @@ class AgentLoop:
                         "result": result,
                     }
                 except Exception as exc:
+                    self._emit_tool_progress(
+                        tool_name=operation_name,
+                        tool_kind="openviking",
+                        tool_status="failed",
+                        title=f"知识库 {task.operation} 检索失败",
+                        metadata={
+                            "task_id": task.task_id,
+                            "query": task.query[:500],
+                            "target_uri": task.target_uri,
+                            "error_type": type(exc).__name__,
+                        },
+                    )
                     logger.warning(
                         "openviking_retrieval_operation_failed",
                         task_id=task.task_id,
@@ -1184,6 +1383,7 @@ class AgentLoop:
                     content=_json(
                         {
                             "query": state.normalized_query,
+                            "role": state.user_role,
                             "verified_draft": state.draft_answer,
                             "evidence": state.selected_evidence,
                         },

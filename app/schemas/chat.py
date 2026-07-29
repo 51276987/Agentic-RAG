@@ -1,6 +1,7 @@
 """This file contains the chat schema for the application."""
 
 import re
+from typing import Any
 from typing import (
     List,
     Literal,
@@ -100,11 +101,24 @@ class StreamResponse(BaseResponse):
         done: Whether the stream is complete.
     """
 
-    event: Literal["message", "hitl", "done", "error"] = Field(
+    event: Literal["message", "tool", "hitl", "done", "error"] = Field(
         default="message",
         description="Frontend-dispatchable event type",
     )
     content: str = Field(default="", description="The content of the current chunk")
+    tool_name: str | None = Field(default=None, description="Stable node or external tool identifier")
+    tool_kind: Literal["node", "openviking"] | None = Field(
+        default=None,
+        description="Whether this is a graph node transition or an OpenViking operation",
+    )
+    tool_status: Literal["started", "completed", "failed"] | None = Field(
+        default=None,
+        description="Current progress state of the tool event",
+    )
+    metadata: dict[str, Any] | None = Field(
+        default=None,
+        description="Small frontend-displayable progress details; never raw evidence content",
+    )
     hitl_type: Literal["question_clarification", "role_clarification"] | None = Field(
         default=None,
         description="HITL workflow type when event is hitl",

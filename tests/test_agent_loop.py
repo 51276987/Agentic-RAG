@@ -12,7 +12,10 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
-from app.core.langgraph.agent_loop import AgentLoop
+from app.core.langgraph.agent_loop import (
+    AgentLoop,
+    _tool_result_documents,
+)
 from app.schemas import (
     AnswerRequirement,
     EvidenceAssessment,
@@ -200,6 +203,26 @@ def test_result_fusion_sorts_find_scores_and_preserves_unscored_grep_matches() -
     assert len(unscored) == 3
     assert all(item["operation"] == "grep" for item in unscored)
     assert all(item["source_level"] == "full" for item in scored)
+
+
+def test_tool_result_documents_returns_compact_unique_document_metadata() -> None:
+    """SSE tool metadata must name real hits without returning their content."""
+    documents = _tool_result_documents(
+        {
+            "resources": [
+                {"uri": "viking://resources/a.md", "level": 2, "score": 0.9},
+                {"uri": "viking://resources/a.md", "level": 2, "score": 0.9},
+            ],
+            "matches": [
+                {"uri": "viking://resources/b.md", "line": 18, "content": "matched content"},
+            ],
+        }
+    )
+
+    assert documents == [
+        {"uri": "viking://resources/a.md", "level": 2, "score": 0.9},
+        {"uri": "viking://resources/b.md", "line": 18},
+    ]
 
 
 def test_evidence_hydration_reads_find_level_two_as_full_content() -> None:
@@ -548,22 +571,22 @@ def test_agent_loop_repairs_missing_evidence_within_two_rounds() -> None:
                 answer_requirements=[
                     AnswerRequirement(
                         requirement_id="req_1",
-                        description="说明认证配置",
+                        description="说明认证配置和验证方法",
                         priority="required",
                         evidence_source="knowledge_base",
                     ),
                     AnswerRequirement(
                         requirement_id="req_2",
-                        description="给出验证方法",
-                        priority="required",
+                        description="补充认证相关资源路径",
+                        priority="optional",
                         evidence_source="knowledge_base",
                     ),
                 ],
             ),
             EvidenceAssessment(
                 required_sufficient=False,
-                covered_required_ids=["req_1"],
-                missing_required_ids=["req_2"],
+                covered_required_ids=[],
+                missing_required_ids=["req_1"],
                 covered_optional_ids=[],
                 missing_optional_ids=[],
                 reason="缺少验证步骤",
@@ -578,7 +601,7 @@ def test_agent_loop_repairs_missing_evidence_within_two_rounds() -> None:
             ),
             EvidenceAssessment(
                 required_sufficient=True,
-                covered_required_ids=["req_1", "req_2"],
+                covered_required_ids=["req_1"],
                 missing_required_ids=[],
                 covered_optional_ids=[],
                 missing_optional_ids=[],

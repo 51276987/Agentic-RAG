@@ -72,10 +72,47 @@ def test_normal_chunk_remains_message_content() -> None:
     assert _format_stream_event(response).startswith("data: ")
 
 
+def test_tool_progress_uses_tool_prefix() -> None:
+    """Graph progress must remain separate from answer content."""
+    chunk = json.dumps(
+        {
+            "type": "tool_progress",
+            "tool_name": "openviking.find",
+            "tool_kind": "openviking",
+            "tool_status": "completed",
+            "title": "知识库 find 检索完成",
+            "metadata": {"task_id": "initial_find", "result_count": 3},
+        },
+        ensure_ascii=False,
+    )
+
+    response = _stream_response_from_chunk(chunk)
+
+    assert response.event == "tool"
+    assert response.tool_name == "openviking.find"
+    assert response.tool_status == "completed"
+    assert response.metadata == {"task_id": "initial_find", "result_count": 3}
+    assert _format_stream_event(response).startswith("tool: ")
+
+
 def test_done_event_keeps_standard_data_prefix() -> None:
-    """Only HITL events should use the custom hitl prefix."""
+    """Completion uses the standard data prefix."""
     response = _stream_response_from_chunk("固定回答")
     response.event = "done"
     response.done = True
 
     assert _format_stream_event(response).startswith("data: ")
+
+
+def test_error_event_uses_error_prefix() -> None:
+    """A terminal internal error must not be serialized as a data event."""
+    response = _stream_response_from_chunk("ignored")
+    response.event = "error"
+    response.content = "服务内部错误，请稍后重试。"
+    response.done = True
+
+    event = _format_stream_event(response)
+
+    assert event.startswith("error: ")
+    assert '"event": "error"' in event
+    assert '"done": true' in event

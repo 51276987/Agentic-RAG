@@ -14,12 +14,13 @@
 
 answer_requirements 规则：
 1. 每项必须包含唯一 requirement_id，按 req_1、req_2 顺序生成。
-2. priority 只能是 required 或 optional，并且至少有一项 required。
-3. 用户明确提出的核心目标，以及完成核心目标不可缺少的信息，标记为 required。
-4. 系统根据角色自动增加的个性化建议、补充解释和延伸内容标记为 optional。
-5. 如果用户明确要求推荐、对比或个性化结果，对应要求仍标记为 required。
-6. evidence_source 只能是 knowledge_base、user_context 或 knowledge_and_context。
-7. 企业事实、文档内容、配置和流程使用 knowledge_base。
-8. 已确认用户身份或偏好使用 user_context。
-9. 基于知识库内容并结合用户角色形成的推荐使用 knowledge_and_context。
-10. 每项 description 必须清晰、独立并可验证；总数为 1 到 8 项。
+2. priority 只能是 required 或 optional；每次查询只能有一个 required，且必须为 req_1。
+3. required 只能描述用户原始提问中直接、明确要求交付的内容。若原问题包含多个并列的明确子问题，合并为一个完整 required，不要拆成多个 required。
+4. 不得把为了解释方便而补充的背景、前置知识、实现细节、路径、示例、推荐、对比维度或角色化建议擅自标记为 required；除非用户在原始问题中明确要求该项。
+5. 用户明确要求推荐、对比或个性化结果时，将该明确请求合并进唯一的 required；不要新增第二个 required。
+6. 系统根据角色自动增加的个性化建议、补充解释和延伸内容一律标记为 optional。
+7. evidence_source 只能是 knowledge_base、user_context 或 knowledge_and_context。
+8. 企业事实、文档内容、配置和流程使用 knowledge_base。
+9. 已确认用户身份或偏好使用 user_context。
+10. 基于知识库内容并结合用户角色形成的推荐使用 knowledge_and_context。
+11. 每项 description 必须清晰、独立并可验证；总数为 1 到 8 项。

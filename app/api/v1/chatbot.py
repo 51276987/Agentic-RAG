@@ -43,6 +43,29 @@ def _stream_response_from_chunk(chunk: str) -> StreamResponse:
     if not isinstance(payload, dict):
         return StreamResponse(event="message", content=chunk, done=False)
 
+    if payload.get("type") == "tool_progress":
+        tool_name = payload.get("tool_name")
+        tool_kind = payload.get("tool_kind")
+        tool_status = payload.get("tool_status")
+        title = payload.get("title")
+        if (
+            not isinstance(tool_name, str)
+            or tool_kind not in {"node", "openviking"}
+            or tool_status not in {"started", "completed", "failed"}
+            or not isinstance(title, str)
+        ):
+            return StreamResponse(event="message", content=chunk, done=False)
+        metadata = payload.get("metadata")
+        return StreamResponse(
+            event="tool",
+            tool_name=tool_name,
+            tool_kind=tool_kind,
+            tool_status=tool_status,
+            title=title,
+            metadata=metadata if isinstance(metadata, dict) else None,
+            done=False,
+        )
+
     hitl_type = payload.get("type")
     title = str(payload.get("question") or "需要您补充信息")
     if hitl_type == "question_clarification":
@@ -75,8 +98,15 @@ def _stream_response_from_chunk(chunk: str) -> StreamResponse:
 
 
 def _format_stream_event(response: StreamResponse) -> str:
-    """Serialize HITL with its custom prefix and all other events as SSE data."""
-    prefix = "hitl" if response.event == "hitl" else "data"
+    """Serialize frontend event types with their stable SSE prefixes."""
+    prefixes = {
+        "message": "data",
+        "tool": "tool",
+        "hitl": "hitl",
+        "error": "error",
+        "done": "data",
+    }
+    prefix = prefixes[response.event]
     payload = json.dumps(
         response.model_dump(mode="json", exclude_none=True),
         ensure_ascii=False,
@@ -146,62 +176,52 @@ async def chat_stream(
     Raises:
         HTTPException: If there's an error processing the request.
     """
-    try:
-        logger.info(
-            "stream_chat_request_received",
-            session_id=session.id,
-            message_count=len(chat_request.messages),
-        )
+    logger.info(
+        "stream_chat_request_received",
+        session_id=session.id,
+        message_count=len(chat_request.messages),
+    )
 
-        if settings.SESSION_NAMING_ENABLED:
-            maybe_name_session(session.id, session.name, chat_request.messages)
+    async def event_generator():
+        """Generate message, HITL, error, and completion SSE events."""
+        try:
+            if settings.SESSION_NAMING_ENABLED:
+                maybe_name_session(session.id, session.name, chat_request.messages)
 
-        async def event_generator():
-            """Generate streaming events.
+            with llm_stream_duration_seconds.labels(model=agent.llm_service.get_llm().get_name()).time():
+                async for chunk in agent.get_stream_response(
+                    chat_request.messages, session.id, user_id=str(session.user_id), username=session.username
+                ):
+                    response = _stream_response_from_chunk(chunk)
+                    yield _format_stream_event(response)
 
-            Yields:
-                str: Server-sent events in JSON format.
+            # Send final message indicating successful completion.
+            final_response = StreamResponse(event="done", content="", done=True)
+            yield _format_stream_event(final_response)
 
-            Raises:
-                Exception: If there's an error during streaming.
-            """
-            try:
-                with llm_stream_duration_seconds.labels(model=agent.llm_service.get_llm().get_name()).time():
-                    async for chunk in agent.get_stream_response(
-                        chat_request.messages, session.id, user_id=str(session.user_id), username=session.username
-                    ):
-                        response = _stream_response_from_chunk(chunk)
-                        yield _format_stream_event(response)
+        except Exception as e:
+            logger.exception(
+                "stream_chat_request_failed",
+                session_id=session.id,
+                error=str(e),
+            )
+            # Keep implementation details in logs while giving clients a
+            # stable, safe terminal SSE payload.
+            error_response = StreamResponse(
+                event="error",
+                content="服务内部错误，请稍后重试。",
+                done=True,
+            )
+            yield _format_stream_event(error_response)
 
-                # Send final message indicating completion
-                final_response = StreamResponse(event="done", content="", done=True)
-                yield _format_stream_event(final_response)
-
-            except Exception as e:
-                logger.exception(
-                    "stream_chat_request_failed",
-                    session_id=session.id,
-                    error=str(e),
-                )
-                error_response = StreamResponse(event="error", content=str(e), done=True)
-                yield _format_stream_event(error_response)
-
-        return StreamingResponse(
-            event_generator(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
-        )
-
-    except Exception as e:
-        logger.exception(
-            "stream_chat_request_failed",
-            session_id=session.id,
-            error=str(e),
-        )
-        raise HTTPException(status_code=500, detail=str(e))
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/messages", response_model=ChatResponse)
