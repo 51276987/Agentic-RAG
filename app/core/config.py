@@ -166,6 +166,10 @@ class Settings:
         self.LONG_TERM_MEMORY_EMBEDDER_BASE_URL = os.getenv("LONG_TERM_MEMORY_EMBEDDER_BASE_URL", "")
         self.LONG_TERM_MEMORY_EMBEDDER_DIMS = int(os.getenv("LONG_TERM_MEMORY_EMBEDDER_DIMS", "1536"))
         self.LONG_TERM_MEMORY_COLLECTION_NAME = os.getenv("LONG_TERM_MEMORY_COLLECTION_NAME", "longterm_memory")
+        self.LONG_TERM_MEMORY_MAX_RESULTS = int(os.getenv("LONG_TERM_MEMORY_MAX_RESULTS", "5"))
+        self.LONG_TERM_MEMORY_MAX_COSINE_DISTANCE = float(
+            os.getenv("LONG_TERM_MEMORY_MAX_COSINE_DISTANCE", "0.35")
+        )
 
         # OpenViking internal API configuration
         self.OPENVIKING_ENABLED = os.getenv("OPENVIKING_ENABLED", "false").lower() in ("true", "1", "t", "yes")
