@@ -15,6 +15,9 @@ with open(os.path.join(_PROMPTS_DIR, "system.md"), "r") as _f:
 with open(os.path.join(_PROMPTS_DIR, "session_title.md"), "r") as _f:
     SESSION_TITLE_PROMPT = _f.read()
 
+with open(os.path.join(_PROMPTS_DIR, "context_compression.md"), "r", encoding="utf-8") as _f:
+    CONTEXT_COMPRESSION_PROMPT = _f.read()
+
 
 def load_system_prompt(username: Optional[str] = None, **kwargs):
     """Load the system prompt from the cached template."""

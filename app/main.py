@@ -30,6 +30,7 @@ from app.core.middleware import (
     ProfilingMiddleware,
 )
 from app.core.observability import langfuse_init, langfuse_shutdown
+from app.services.context_compression import context_compression_service
 from app.services.database import database_service
 from app.services.memory import memory_service
 
@@ -69,9 +70,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.exception("memory_service_pre_warm_failed", error=str(e))
 
+    # Start the persistent background worker after Alembic has created its job
+    # table.  Failure degrades to bounded raw history without blocking chat.
+    try:
+        await context_compression_service.initialize()
+    except Exception as e:
+        logger.exception("context_compression_pre_warm_failed", error=str(e))
+
     yield
 
     # Cleanup on shutdown
+    await context_compression_service.close()
     await cache_service.close()
     if agent._connection_pool:
         await agent._connection_pool.close()

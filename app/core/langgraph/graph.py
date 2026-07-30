@@ -48,6 +48,10 @@ from app.schemas import (
     GraphState,
     Message,
 )
+from app.services.context_compression import (
+    ContextCompressionService,
+    context_compression_service,
+)
 from app.services.llm import llm_service
 from app.services.memory import memory_service
 from app.services.openviking import openviking_knowledge_api
@@ -108,10 +112,14 @@ class LangGraphAgent:
     including LLM interactions, database connections, and response processing.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        context_service: ContextCompressionService = context_compression_service,
+    ):
         """Initialize the LangGraph Agent with necessary components."""
         self.llm_service = llm_service
         self.agent_loop = AgentLoop(self.llm_service, openviking_knowledge_api)
+        self.context_compression_service = context_service
         self._connection_pool: Optional[PostgresConnPool] = None
         self._graph: Optional[CompiledStateGraph] = None
         logger.info(
@@ -261,8 +269,18 @@ class LangGraphAgent:
                 )
             else:
                 relevant_memory = relevant_memory or "No relevant memory found."
+                conversation_context = await self.context_compression_service.prepare_context(
+                    session_id=session_id,
+                    thread_id=_checkpoint_thread_id(session_id),
+                    checkpoint_id=self._checkpoint_id(state),
+                    messages=state.values.get("messages", []) if state.values else [],
+                )
                 response = await graph.ainvoke(
-                    input={"messages": dump_messages(messages), "long_term_memory": relevant_memory},
+                    input={
+                        "messages": dump_messages(messages),
+                        "conversation_context": conversation_context,
+                        "long_term_memory": relevant_memory,
+                    },
                     config=config,
                 )
 
@@ -273,6 +291,12 @@ class LangGraphAgent:
                 logger.info("graph_interrupted", session_id=session_id, interrupt_value=str(interrupt_value))
                 return [ChatHistoryMessage(role="assistant", content=self._format_interrupt(interrupt_value))]
 
+            await self.context_compression_service.enqueue_recent_turns(
+                session_id=session_id,
+                thread_id=_checkpoint_thread_id(session_id),
+                checkpoint_id=self._checkpoint_id(state),
+                messages=state.values.get("messages", []) if state.values else [],
+            )
             openai_msgs = cast(list[dict], convert_to_openai_messages(response["messages"]))
             asyncio.create_task(memory_service.add(user_id, openai_msgs, config.get("metadata")))
             return self.__process_messages(response["messages"])
@@ -328,7 +352,17 @@ class LangGraphAgent:
                 graph_input = Command(resume=messages[-1].content)
             else:
                 relevant_memory = relevant_memory or "No relevant memory found."
-                graph_input = {"messages": dump_messages(messages), "long_term_memory": relevant_memory}
+                conversation_context = await self.context_compression_service.prepare_context(
+                    session_id=session_id,
+                    thread_id=_checkpoint_thread_id(session_id),
+                    checkpoint_id=self._checkpoint_id(state),
+                    messages=state.values.get("messages", []) if state.values else [],
+                )
+                graph_input = {
+                    "messages": dump_messages(messages),
+                    "conversation_context": conversation_context,
+                    "long_term_memory": relevant_memory,
+                }
 
             async for stream_mode, update in graph.astream(
                 graph_input,
@@ -390,6 +424,12 @@ class LangGraphAgent:
                         route=state.values.get("route"),
                     )
                     raise RuntimeError("请求已完成，但未生成可返回内容")
+                await self.context_compression_service.enqueue_recent_turns(
+                    session_id=session_id,
+                    thread_id=_checkpoint_thread_id(session_id),
+                    checkpoint_id=self._checkpoint_id(state),
+                    messages=state.values["messages"],
+                )
                 openai_msgs = cast(list[dict], convert_to_openai_messages(state.values["messages"]))
                 asyncio.create_task(memory_service.add(user_id, openai_msgs, config.get("metadata")))
         except GraphInterrupt:
@@ -430,6 +470,13 @@ class LangGraphAgent:
         ]
 
     @staticmethod
+    def _checkpoint_id(state: StateSnapshot) -> str | None:
+        """Extract the immutable source checkpoint ID for compression tracing."""
+        configurable = state.config.get("configurable", {}) if state.config else {}
+        checkpoint_id = configurable.get("checkpoint_id")
+        return str(checkpoint_id) if checkpoint_id else None
+
+    @staticmethod
     def _format_interrupt(value: object) -> str:
         """Serialize structured HITL payloads as valid JSON."""
         if isinstance(value, (dict, list)):
@@ -465,9 +512,10 @@ class LangGraphAgent:
                     tables=settings.CHECKPOINT_TABLES,
                     session_id=session_id,
                 )
+            await self.context_compression_service.delete_session(session_id)
 
         except Exception as e:
-            logger.error(
+            logger.exception(
                 "clear_chat_history_operation_failed",
                 session_id=session_id,
                 error=str(e),

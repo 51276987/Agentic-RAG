@@ -20,6 +20,7 @@ from langchain_core.messages import BaseMessage
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.output_parsers.openai_tools import PydanticToolsParser
 from langchain_core.runnables import RunnableLambda
+from langchain_core.runnables.config import RunnableConfig
 from openai import (
     APIError,
     APITimeoutError,
@@ -117,6 +118,8 @@ class LLMService:
         messages: LanguageModelInput,
         model_name: Optional[str] = ...,
         response_format: None = ...,
+        *,
+        runnable_config: Optional[RunnableConfig] = ...,
         **model_kwargs: Any,
     ) -> BaseMessage: ...
 
@@ -127,6 +130,7 @@ class LLMService:
         model_name: Optional[str] = ...,
         *,
         response_format: Type[T],
+        runnable_config: Optional[RunnableConfig] = ...,
         **model_kwargs: Any,
     ) -> T: ...
 
@@ -135,6 +139,8 @@ class LLMService:
         messages: LanguageModelInput,
         model_name: Optional[str] = None,
         response_format: Optional[Type[BaseModel]] = None,
+        *,
+        runnable_config: Optional[RunnableConfig] = None,
         **model_kwargs: Any,
     ) -> Union[BaseMessage, BaseModel]:
         """Call the LLM with retries and circular fallback.
@@ -147,6 +153,8 @@ class LLMService:
                 ``tool_choice`` and its arguments are validated as that schema.
                 This remains compatible with thinking models that accept tools
                 but reject forced tool selection.
+            runnable_config: Optional callbacks, tags, metadata, and run name
+                forwarded to the LangChain invocation.
             **model_kwargs: Extra kwargs forwarded to ``LLMRegistry.get`` when
                 constructing a one-off model instance (e.g. ``temperature``,
                 ``max_tokens``, ``reasoning``).
@@ -161,7 +169,13 @@ class LLMService:
         """
         try:
             return await asyncio.wait_for(
-                self._call_with_fallback(messages, model_name, response_format, model_kwargs),
+                self._call_with_fallback(
+                    messages,
+                    model_name,
+                    response_format,
+                    model_kwargs,
+                    runnable_config,
+                ),
                 timeout=settings.LLM_TOTAL_TIMEOUT,
             )
         except asyncio.TimeoutError:
@@ -218,12 +232,18 @@ class LLMService:
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
     )
-    async def _invoke_with_retry(self, llm: Any, messages: LanguageModelInput) -> Any:
+    async def _invoke_with_retry(
+        self,
+        llm: Any,
+        messages: LanguageModelInput,
+        runnable_config: Optional[RunnableConfig] = None,
+    ) -> Any:
         """Invoke an LLM runnable with automatic per-model retry logic.
 
         Args:
             llm: Any LangChain ``Runnable`` (plain model or structured-output chain).
             messages: Messages to send.
+            runnable_config: Optional runtime tracing configuration.
 
         Returns:
             The runnable's response (``BaseMessage`` or a ``BaseModel`` instance).
@@ -232,7 +252,10 @@ class LLMService:
             OpenAIError: Propagated after all retry attempts are exhausted.
         """
         try:
-            response = await llm.ainvoke(messages)
+            if runnable_config is None:
+                response = await llm.ainvoke(messages)
+            else:
+                response = await llm.ainvoke(messages, config=runnable_config)
             logger.debug("llm_call_successful")
             return response
         except (RateLimitError, APITimeoutError, APIError, StructuredOutputError) as e:
@@ -305,6 +328,7 @@ class LLMService:
         model_name: Optional[str],
         response_format: Optional[Type[BaseModel]],
         model_kwargs: dict,
+        runnable_config: Optional[RunnableConfig],
     ) -> Union[BaseMessage, BaseModel]:
         """Build path-specific strategies and delegate to the shared fallback loop.
 
@@ -348,7 +372,13 @@ class LLMService:
             get_target = _default_target
             advance = _default_advance
 
-        return await self._fallback_loop(messages, start, get_target, advance)
+        return await self._fallback_loop(
+            messages,
+            start,
+            get_target,
+            advance,
+            runnable_config,
+        )
 
     async def _fallback_loop(
         self,
@@ -356,6 +386,7 @@ class LLMService:
         start: int,
         get_target: Callable[[int], Any],
         advance: Callable[[int], Optional[int]],
+        runnable_config: Optional[RunnableConfig],
     ) -> Any:
         """Shared fallback loop — try each model in turn until one succeeds.
 
@@ -364,6 +395,7 @@ class LLMService:
             start: Registry index to begin from.
             get_target: Returns the ``Runnable`` to invoke for a given index.
             advance: Returns the next index to try, or ``None`` to stop.
+            runnable_config: Optional runtime tracing configuration.
 
         Returns:
             The first successful response.
@@ -379,7 +411,11 @@ class LLMService:
         for models_tried in range(1, total + 1):
             current_name = LLMRegistry.LLMS[current]["name"]
             try:
-                return await self._invoke_with_retry(get_target(current), messages)
+                return await self._invoke_with_retry(
+                    get_target(current),
+                    messages,
+                    runnable_config,
+                )
             except (OpenAIError, StructuredOutputError) as e:
                 last_error = e
                 logger.error(

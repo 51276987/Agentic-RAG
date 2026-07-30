@@ -5,9 +5,14 @@ import asyncio
 import pytest
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
+from langchain_core.runnables.config import RunnableConfig
 
 from app.schemas.agentic_rag import EvidenceAssessment
-from app.services.llm.service import StructuredOutputError, _structured_output_runnable
+from app.services.llm.service import (
+    LLMService,
+    StructuredOutputError,
+    _structured_output_runnable,
+)
 
 
 class FakeChatModel:
@@ -20,6 +25,19 @@ class FakeChatModel:
     def bind_tools(self, _: list[type[EvidenceAssessment]]) -> RunnableLambda:
         """Mimic a chat model with tool binding support."""
         return RunnableLambda(lambda _messages: self.response)
+
+
+class ConfigAwareRunnable:
+    """Capture runtime tracing configuration passed to ``ainvoke``."""
+
+    def __init__(self) -> None:
+        """Initialize an empty captured config."""
+        self.config = None
+
+    async def ainvoke(self, _: list, config=None) -> AIMessage:
+        """Return a response while recording LangChain runtime config."""
+        self.config = config
+        return AIMessage(content="summary")
 
 
 def test_structured_output_accepts_plain_json_content() -> None:
@@ -75,3 +93,24 @@ def test_structured_output_rejects_empty_response() -> None:
 
     with pytest.raises(StructuredOutputError, match="EvidenceAssessment"):
         asyncio.run(runnable.ainvoke([]))
+
+
+def test_invoke_with_retry_forwards_runnable_config() -> None:
+    """Background compression traces must reach the underlying LLM runnable."""
+    service = object.__new__(LLMService)
+    runnable = ConfigAwareRunnable()
+    config: RunnableConfig = {
+        "run_name": "context-compression",
+        "metadata": {"context_compression_job_id": "job-1"},
+    }
+
+    response = asyncio.run(
+        service._invoke_with_retry(  # noqa: SLF001
+            runnable,
+            [],
+            config,
+        )
+    )
+
+    assert response.content == "summary"
+    assert runnable.config == config

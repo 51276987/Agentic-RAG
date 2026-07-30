@@ -23,6 +23,10 @@ class GraphState(BaseModel):
     messages: Annotated[list, add_messages] = Field(
         default_factory=list, description="The messages in the conversation"
     )
+    conversation_context: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Bounded summaries/full turns injected into LLM prompts without replacing checkpoint history",
+    )
     long_term_memory: str = Field(default="", description="The long term memory of the conversation")
     user_query: str = ""
     normalized_query: str = ""

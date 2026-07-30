@@ -47,9 +47,16 @@ MAX_HYDRATED_RESOURCES = 8
 MAX_FULL_CONTENT_RESOURCES = 4
 MAX_EVIDENCE_CHARS = 24_000
 MAX_TOOL_RESULT_DOCUMENTS = 10
-INTENT_HISTORY_MAX_MESSAGES = 4  # Two user/assistant turns.
 ROOT_RESOURCES_URI = "viking://resources"
 SourceLevel = Literal["abstract", "overview", "full"]
+
+_CONTEXT_USAGE_INSTRUCTIONS = """
+recent_messages 是系统构建的有界会话上下文：
+- type=user/assistant 表示保留的原始消息；
+- type=conversation_summary 且 compressed=true 表示对应历史轮次的可信压缩摘要。
+可以使用它解析“它、这个、继续、上一个方案”等上下文指代，但不得把摘要内容当成知识库事实。
+知识库系统范围只能依据当前 query 中明确出现的系统名称确定，不允许从 recent_messages 或长期记忆继承。
+""".strip()
 
 _ROLE_LABELS = {
     "product_manager": "产品经理",
@@ -541,19 +548,17 @@ class AgentLoop:
 
     async def intent_analyzer(self, state: GraphState) -> dict[str, Any]:
         """Analyze intent and perform evidence-based role classification."""
-        recent_messages = [
-            {"type": getattr(message, "type", "unknown"), "content": _message_text(message)}
-            for message in state.messages[-INTENT_HISTORY_MAX_MESSAGES:]
-        ]
         payload = {
             "query": state.normalized_query,
             "confirmed_role": state.user_role,
-            "recent_messages": recent_messages,
+            "recent_messages": state.conversation_context,
             "long_term_memory": state.long_term_memory,
         }
         analysis = await self.llm_service.call(
             [
-                SystemMessage(content=get_agentic_rag_prompt("intent_analyzer")),
+                SystemMessage(
+                    content=f"{get_agentic_rag_prompt('intent_analyzer')}\n\n{_CONTEXT_USAGE_INSTRUCTIONS}"
+                ),
                 HumanMessage(content=_json(payload)),
             ],
             response_format=IntentAnalysis,
@@ -1411,12 +1416,15 @@ class AgentLoop:
         chunks: list[str] = []
         async for chunk in self.llm_service.stream(
             [
-                SystemMessage(content=get_agentic_rag_prompt("direct_answer")),
+                SystemMessage(
+                    content=f"{get_agentic_rag_prompt('direct_answer')}\n\n{_CONTEXT_USAGE_INSTRUCTIONS}"
+                ),
                 HumanMessage(
                     content=_json(
                         {
                             "query": state.normalized_query,
                             "role": state.user_role,
+                            "recent_messages": state.conversation_context,
                             "long_term_memory": state.long_term_memory,
                         }
                     )

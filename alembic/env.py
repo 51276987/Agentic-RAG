@@ -11,6 +11,7 @@ from sqlmodel import SQLModel
 
 from alembic import context
 from app.core.config import settings
+from app.models.context_compression_job import ContextCompressionJob  # noqa: F401
 from app.models.session import Session  # noqa: F401
 from app.models.thread import Thread  # noqa: F401
 from app.models.user import User  # noqa: F401
@@ -40,6 +41,7 @@ EXCLUDE_TABLES = {
     "checkpoint_migrations",
     "checkpoints",
     "longterm_memory",
+    settings.LONG_TERM_MEMORY_COLLECTION_NAME,
     "mem0migrations",
 }
 
@@ -47,6 +49,8 @@ EXCLUDE_TABLES = {
 def include_object(object, name, type_, reflected, compare_to):
     """Filter out tables managed by external systems."""
     if type_ == "table" and name in EXCLUDE_TABLES:
+        return False
+    if type_ == "index" and any(name.startswith(f"{table_name}_") for table_name in EXCLUDE_TABLES):
         return False
     return True
 

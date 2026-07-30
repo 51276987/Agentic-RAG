@@ -159,6 +159,30 @@ class Settings:
         self.MAX_LLM_CALL_RETRIES = int(os.getenv("MAX_LLM_CALL_RETRIES", "3"))
         self.LLM_TOTAL_TIMEOUT = int(os.getenv("LLM_TOTAL_TIMEOUT", "60"))
 
+        # Asynchronous conversation-context compression
+        self.CONTEXT_COMPRESSION_ENABLED = os.getenv("CONTEXT_COMPRESSION_ENABLED", "true").lower() in (
+            "true",
+            "1",
+            "t",
+            "yes",
+        )
+        self.CONTEXT_COMPRESSION_MODEL = os.getenv("CONTEXT_COMPRESSION_MODEL", self.DEFAULT_LLM_MODEL)
+        self.CONTEXT_COMPRESSION_PROMPT_VERSION = int(os.getenv("CONTEXT_COMPRESSION_PROMPT_VERSION", "1"))
+        self.CONTEXT_RECENT_FULL_MAX_CHARS = int(os.getenv("CONTEXT_RECENT_FULL_MAX_CHARS", "12000"))
+        self.CONTEXT_HISTORY_HARD_MAX_CHARS = int(os.getenv("CONTEXT_HISTORY_HARD_MAX_CHARS", "24000"))
+        self.CONTEXT_COMPRESSION_SOURCE_MAX_CHARS = int(
+            os.getenv("CONTEXT_COMPRESSION_SOURCE_MAX_CHARS", "30000")
+        )
+        self.CONTEXT_COMPRESSION_SUMMARY_MAX_CHARS = int(
+            os.getenv("CONTEXT_COMPRESSION_SUMMARY_MAX_CHARS", "1500")
+        )
+        self.CONTEXT_COMPRESSION_SUMMARY_MAX_TOKENS = int(
+            os.getenv("CONTEXT_COMPRESSION_SUMMARY_MAX_TOKENS", "512")
+        )
+        self.CONTEXT_COMPRESSION_STALE_SECONDS = int(os.getenv("CONTEXT_COMPRESSION_STALE_SECONDS", "600"))
+        self.CONTEXT_COMPRESSION_POLL_SECONDS = float(os.getenv("CONTEXT_COMPRESSION_POLL_SECONDS", "1"))
+        self.CONTEXT_COMPRESSION_DB_POOL_SIZE = int(os.getenv("CONTEXT_COMPRESSION_DB_POOL_SIZE", "2"))
+
         # Long term memory Configuration
         self.LONG_TERM_MEMORY_MODEL = os.getenv("LONG_TERM_MEMORY_MODEL", self.DEFAULT_LLM_MODEL)
         self.LONG_TERM_MEMORY_EMBEDDER_PROVIDER = os.getenv("LONG_TERM_MEMORY_EMBEDDER_PROVIDER", "openai").lower()

@@ -152,6 +152,74 @@ def _build_graph(llm: FakeLLMService, api: FakeOpenVikingAPI, *, checkpointer: A
     return builder.compile(checkpointer=checkpointer)
 
 
+def test_intent_analyzer_reads_injected_conversation_context() -> None:
+    """Intent analysis should consume the compressed projection, not raw checkpoint history."""
+    llm = FakeLLMService(
+        [
+            IntentAnalysis(
+                intent="fact_lookup",
+                needs_retrieval=True,
+                answer_requirements=[
+                    AnswerRequirement(
+                        requirement_id="req_1",
+                        description="answer the current question",
+                        priority="required",
+                        evidence_source="knowledge_base",
+                    )
+                ],
+            )
+        ]
+    )
+    loop = AgentLoop(llm, FakeOpenVikingAPI())  # pyright: ignore[reportArgumentType]
+    injected_context = [
+        {
+            "type": "conversation_summary",
+            "content": "the previous topic was ANN",
+            "turn_index": 2,
+            "compressed": True,
+        }
+    ]
+
+    asyncio.run(
+        loop.intent_analyzer(
+            GraphState(
+                messages=[
+                    HumanMessage(content="raw history must not be selected"),
+                    HumanMessage(content="continue"),
+                ],
+                conversation_context=injected_context,
+                normalized_query="continue",
+            )
+        )
+    )
+
+    payload = json.loads(llm.calls[0][0][-1].content)
+    assert payload["recent_messages"] == injected_context
+
+
+def test_intent_analysis_normalizes_string_null_role_fields() -> None:
+    """OpenAI-compatible models sometimes serialize optional enum nulls as strings."""
+    analysis = IntentAnalysis.model_validate(
+        {
+            "intent": "fact_lookup",
+            "needs_retrieval": True,
+            "user_role": "null",
+            "role_source": "null",
+            "answer_requirements": [
+                {
+                    "requirement_id": "req_1",
+                    "description": "answer the explicit question",
+                    "priority": "required",
+                    "evidence_source": "knowledge_base",
+                }
+            ],
+        }
+    )
+
+    assert analysis.user_role is None
+    assert analysis.role_source is None
+
+
 def test_result_fusion_sorts_find_scores_and_preserves_unscored_grep_matches() -> None:
     """Find hits should be score-sorted while grep matches retain source order."""
     loop = AgentLoop(FakeLLMService([]), FakeOpenVikingAPI())  # pyright: ignore[reportArgumentType]

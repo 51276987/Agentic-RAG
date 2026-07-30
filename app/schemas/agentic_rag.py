@@ -8,6 +8,7 @@ from typing import (
 from pydantic import (
     BaseModel,
     Field,
+    field_validator,
     model_validator,
 )
 
@@ -49,6 +50,20 @@ class IntentAnalysis(BaseModel):
     entities: list[str] = Field(default_factory=list, max_length=10)
     constraints: list[str] = Field(default_factory=list, max_length=10)
     answer_requirements: list[AnswerRequirement] = Field(default_factory=list, min_length=1, max_length=8)
+
+    @field_validator("user_role", "role_source", mode="before")
+    @classmethod
+    def normalize_nullable_enum_strings(cls, value: object) -> object:
+        """Normalize common model-rendered null strings before enum validation."""
+        if isinstance(value, str) and value.strip().lower() in {
+            "",
+            "null",
+            "none",
+            "nil",
+            "undefined",
+        }:
+            return None
+        return value
 
     @model_validator(mode="after")
     def validate_answer_requirements(self) -> Self:
