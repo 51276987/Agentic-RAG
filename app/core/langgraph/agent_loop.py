@@ -47,6 +47,7 @@ MAX_HYDRATED_RESOURCES = 8
 MAX_FULL_CONTENT_RESOURCES = 4
 MAX_EVIDENCE_CHARS = 24_000
 MAX_TOOL_RESULT_DOCUMENTS = 10
+INTENT_HISTORY_MAX_MESSAGES = 4  # Two user/assistant turns.
 ROOT_RESOURCES_URI = "viking://resources"
 SourceLevel = Literal["abstract", "overview", "full"]
 
@@ -542,7 +543,7 @@ class AgentLoop:
         """Analyze intent and perform evidence-based role classification."""
         recent_messages = [
             {"type": getattr(message, "type", "unknown"), "content": _message_text(message)}
-            for message in state.messages[-8:]
+            for message in state.messages[-INTENT_HISTORY_MAX_MESSAGES:]
         ]
         payload = {
             "query": state.normalized_query,
