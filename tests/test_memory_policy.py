@@ -13,7 +13,7 @@ from app.services.memory import (
 
 
 def test_memory_retrieval_keeps_only_near_cosine_distances() -> None:
-    """pgvector cosine distance is lower-is-better and weak matches are excluded."""
+    """Pgvector cosine distance is lower-is-better and weak matches are excluded."""
     result = _format_relevant_memories(
         {
             "results": [
