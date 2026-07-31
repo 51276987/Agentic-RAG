@@ -341,9 +341,10 @@ def test_evidence_hydration_reads_find_level_two_as_full_content() -> None:
     assert any(item["level"] == "full" for item in result["selected_evidence"])
 
 
-def test_finalizer_emits_model_tokens_through_custom_stream() -> None:
-    """Only the post-verification finalizer should expose model token chunks."""
-    verified_draft = "这是经过证据与引用校验的最终回答。"
+def test_finalizer_emits_only_backend_rendered_sources() -> None:
+    """Finalizer must publish only backend-rendered source URIs."""
+    verified_draft = "这是经过证据与引用校验的最终回答。【知识来源：SRC-001】"
+    source_uri = "viking://resources/guide.md"
     llm = FakeLLMService([])
     loop = AgentLoop(llm, FakeOpenVikingAPI())  # pyright: ignore[reportArgumentType]
     builder = StateGraph(GraphState)
@@ -356,20 +357,128 @@ def test_finalizer_emits_model_tokens_through_custom_stream() -> None:
         chunks: list[str] = []
         final_update: dict[str, Any] = {}
         async for mode, payload in graph.astream(
-            GraphState(draft_answer=verified_draft),
+            GraphState(
+                draft_answer=verified_draft,
+                selected_evidence=[{"uri": source_uri, "content": "指南正文"}],
+            ),
             stream_mode=["custom", "updates"],
         ):
             if mode == "custom":
-                chunks.append(payload["content"])
+                chunks.append(payload["content"])  # pyright: ignore[reportArgumentType]
             elif mode == "updates" and "finalizer" in payload:
-                final_update = payload["finalizer"]
+                final_update = payload["finalizer"]  # pyright: ignore[reportArgumentType, reportAssignmentType]
         return chunks, final_update
 
     chunks, final_update = asyncio.run(collect())
 
-    assert len(chunks) > 1
-    assert "".join(chunks) == verified_draft
-    assert final_update["final_answer"] == verified_draft
+    expected = f"这是经过证据与引用校验的最终回答。【知识来源：{source_uri}】"
+    assert "".join(chunks) == expected
+    assert final_update["final_answer"] == expected
+    finalizer_payload = json.loads(llm.calls[0][0][-1].content)
+    assert source_uri not in json.dumps(finalizer_payload, ensure_ascii=False)
+    assert finalizer_payload["evidence"][0]["source_id"] == "SRC-001"
+
+
+def test_finalizer_rejects_model_generated_uri_and_uses_verified_draft() -> None:
+    """A forged model URI must never reach the custom output stream."""
+    source_uri = "viking://resources/guide.md"
+    verified_draft = "请阅读指南。【知识来源：SRC-001】"
+    llm = FakeLLMService(
+        [AIMessage(content="请阅读伪造指南。【知识来源：viking://resources/fake.md】")]
+    )
+    loop = AgentLoop(llm, FakeOpenVikingAPI())  # pyright: ignore[reportArgumentType]
+    builder = StateGraph(GraphState)
+    builder.add_node("finalizer", loop.finalizer)
+    builder.add_edge(START, "finalizer")
+    builder.add_edge("finalizer", END)
+    graph = builder.compile()
+
+    async def collect() -> tuple[str, dict[str, Any]]:
+        chunks: list[str] = []
+        final_update: dict[str, Any] = {}
+        async for mode, payload_any in graph.astream(
+            GraphState(
+                draft_answer=verified_draft,
+                selected_evidence=[{"uri": source_uri, "content": "指南正文"}],
+            ),
+            stream_mode=["custom", "updates"],
+        ):
+            payload: Any = payload_any
+            if mode == "custom":
+                chunks.append(payload["content"])  # pyright: ignore[reportArgumentType]
+            elif mode == "updates" and "finalizer" in payload:
+                final_update = payload["finalizer"]  # pyright: ignore[reportArgumentType, reportAssignmentType]
+        return "".join(chunks), final_update
+
+    streamed_answer, final_update = asyncio.run(collect())
+
+    expected = f"请阅读指南。【知识来源：{source_uri}】"
+    assert streamed_answer == expected
+    assert final_update["final_answer"] == expected
+    assert "fake.md" not in streamed_answer
+
+
+def test_groundedness_verifier_rejects_unknown_source_id_before_llm_call() -> None:
+    """Unknown source IDs fail closed and trigger one deterministic revision."""
+    llm = FakeLLMService([])
+    loop = AgentLoop(llm, FakeOpenVikingAPI())  # pyright: ignore[reportArgumentType]
+    state = GraphState(
+        draft_answer="这是一个回答。【知识来源：SRC-999】",
+        selected_evidence=[
+            {
+                "uri": "viking://resources/guide.md",
+                "content": "指南正文",
+            }
+        ],
+    )
+
+    result = asyncio.run(loop.groundedness_verifier(state))
+
+    assert result["route"] == "answer_generator"
+    assert result["revision_count"] == 1
+    assert "未知知识来源 ID" in result["revision_instructions"]
+    assert llm.calls == []
+
+
+def test_groundedness_verifier_uses_source_ids_without_exposing_uri() -> None:
+    """Citation validation uses backend-issued IDs and hides real URIs from the LLM."""
+    llm = FakeLLMService(
+        [
+            GroundednessAssessment(
+                passed=True,
+                action="pass",
+                unsupported_claims=[],
+                missing_required_ids=[],
+                missing_optional_ids=[],
+            )
+        ]
+    )
+    loop = AgentLoop(llm, FakeOpenVikingAPI())  # pyright: ignore[reportArgumentType]
+    state = GraphState(
+        answer_requirements=[
+            {
+                "requirement_id": "req_1",
+                "description": "说明代码仓库内容",
+                "priority": "required",
+                "evidence_source": "knowledge_base",
+            }
+        ],
+        draft_answer="代码仓库包含实现文件。【知识来源：SRC-001】",
+        selected_evidence=[
+            {
+                "uri": "viking://resources/psLoss/.overview.md",
+                "content": "代码仓库包含模型实现文件。",
+            }
+        ],
+    )
+
+    result = asyncio.run(loop.groundedness_verifier(state))
+    payload = json.loads(llm.calls[0][0][-1].content)
+
+    assert result["route"] == "finalizer"
+    assert result["revision_instructions"] == ""
+    assert "viking://" not in json.dumps(payload, ensure_ascii=False)
+    assert payload["evidence"][0]["source_id"] == "SRC-001"
 
 
 def test_agent_loop_runs_read_only_retrieval_to_verified_answer() -> None:
@@ -396,7 +505,7 @@ def test_agent_loop_runs_read_only_retrieval_to_verified_answer() -> None:
                 missing_optional_ids=[],
                 reason="目录结果和摘要足够",
             ),
-            AIMessage(content="知识库包含 guide.md。[来源: viking://resources/guide.md]"),
+            AIMessage(content="知识库包含 guide.md。【知识来源：SRC-001】"),
             GroundednessAssessment(
                 passed=True,
                 action="pass",
@@ -468,7 +577,7 @@ def test_system_scope_limits_all_retrieval_to_explicit_system_folder() -> None:
                 missing_optional_ids=[],
                 reason="已找到支付系统认证配置",
             ),
-            AIMessage(content="支付系统使用令牌认证。[来源: viking://resources/支付系统/auth.md]"),
+            AIMessage(content="支付系统使用令牌认证。【知识来源：SRC-001】"),
             GroundednessAssessment(
                 passed=True,
                 action="pass",
@@ -675,7 +784,7 @@ def test_agent_loop_repairs_missing_evidence_within_two_rounds() -> None:
                 missing_optional_ids=[],
                 reason="配置和验证证据完整",
             ),
-            AIMessage(content="按照文档配置并执行验证命令。[来源: viking://resources/auth.md]"),
+            AIMessage(content="按照文档配置并执行验证命令。【知识来源：SRC-001】"),
             GroundednessAssessment(
                 passed=True,
                 action="pass",
@@ -761,7 +870,7 @@ def test_agent_loop_uses_one_grep_round_then_requests_question_clarification() -
                 missing_optional_ids=[],
                 reason="用户补充版本后检索到完整证据",
             ),
-            AIMessage(content="请按 v2 配置并验证。[来源: viking://resources/支付系统/auth_v2.md]"),
+            AIMessage(content="请按 v2 配置并验证。【知识来源：SRC-001】"),
             GroundednessAssessment(
                 passed=True,
                 action="pass",
@@ -966,7 +1075,7 @@ def test_agent_loop_uses_grep_match_as_evidence() -> None:
                 missing_optional_ids=[],
                 reason="grep 命中错误码及处理方法",
             ),
-            AIMessage(content="按认证文档更新令牌。[来源: viking://resources/errors.md]"),
+            AIMessage(content="按认证文档更新令牌。【知识来源：SRC-001】"),
             GroundednessAssessment(
                 passed=True,
                 action="pass",
@@ -1051,7 +1160,7 @@ def test_optional_requirement_does_not_trigger_retrieval_fallback() -> None:
                 missing_optional_ids=["req_3"],
                 reason="必须项证据充分，可选推荐缺少依据",
             ),
-            AIMessage(content="知识库包含 guide.md。[来源: viking://resources/guide.md]"),
+            AIMessage(content="知识库包含 guide.md。【知识来源：SRC-001】"),
             GroundednessAssessment(
                 passed=True,
                 action="pass",

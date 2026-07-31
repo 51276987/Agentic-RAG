@@ -3,7 +3,7 @@
 import asyncio
 import json
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import (
     Any,
     Literal,
@@ -49,6 +49,10 @@ MAX_EVIDENCE_CHARS = 24_000
 MAX_TOOL_RESULT_DOCUMENTS = 10
 ROOT_RESOURCES_URI = "viking://resources"
 SourceLevel = Literal["abstract", "overview", "full"]
+_SOURCE_MARKER_PATTERN = re.compile(r"【知识来源：(SRC-\d{3})】")
+_SOURCE_MARKER_CANDIDATE_PATTERN = re.compile(r"【知识来源：([^】]*)】")
+_VIKING_URI_PATTERN = re.compile(r"viking://[^\s\]）)】}>，。；;、]+", re.IGNORECASE)
+_LEGACY_SOURCE_MARKER_PATTERN = re.compile(r"(?:\[来源\s*:|【来源\s*：)")
 
 _CONTEXT_USAGE_INSTRUCTIONS = """
 recent_messages 是系统构建的有界会话上下文：
@@ -112,6 +116,73 @@ def _message_text(message: Any) -> str:
         content = message.get("content", "")
         return extract_text_content(content) if isinstance(content, (str, list)) else str(content)
     return str(message)
+
+
+def _redact_viking_uris(value: Any) -> Any:
+    """Remove backend-owned resource URIs from data sent to an LLM."""
+    if isinstance(value, str):
+        return _VIKING_URI_PATTERN.sub("[内部资源地址已隐藏]", value)
+    if isinstance(value, list):
+        return [_redact_viking_uris(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _redact_viking_uris(item)
+            for key, item in value.items()
+            if key.lower() != "uri" and not key.lower().endswith("_uri")
+        }
+    return value
+
+
+def _build_llm_evidence(
+    evidence: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Replace real evidence URIs with stable request-local source IDs."""
+    uri_to_source_id: dict[str, str] = {}
+    source_uri_map: dict[str, str] = {}
+    llm_evidence: list[dict[str, Any]] = []
+    for item in evidence:
+        uri = str(item.get("uri") or "").strip()
+        if not uri:
+            continue
+        source_id = uri_to_source_id.get(uri)
+        if source_id is None:
+            source_id = f"SRC-{len(uri_to_source_id) + 1:03d}"
+            uri_to_source_id[uri] = source_id
+            source_uri_map[source_id] = uri
+        safe_item = _redact_viking_uris(item)
+        if not isinstance(safe_item, dict):
+            continue
+        llm_evidence.append({**safe_item, "source_id": source_id})
+    return llm_evidence, source_uri_map
+
+
+def _validate_source_markers(answer: str, source_uri_map: Mapping[str, str]) -> list[str]:
+    """Validate that a model used only backend-issued source IDs."""
+    if _VIKING_URI_PATTERN.search(answer):
+        raise ValueError("模型输出中禁止包含 viking URI")
+    if _LEGACY_SOURCE_MARKER_PATTERN.search(answer):
+        raise ValueError("模型必须使用【知识来源：SRC-XXX】格式")
+
+    marker_values = _SOURCE_MARKER_CANDIDATE_PATTERN.findall(answer)
+    source_ids = _SOURCE_MARKER_PATTERN.findall(answer)
+    if len(marker_values) != len(source_ids):
+        raise ValueError("模型输出了格式错误的知识来源标记")
+    if source_uri_map and not source_ids:
+        raise ValueError("知识库回答缺少知识来源标记")
+
+    unknown_ids = sorted({source_id for source_id in source_ids if source_id not in source_uri_map})
+    if unknown_ids:
+        raise ValueError(f"模型输出了未知知识来源 ID: {', '.join(unknown_ids)}")
+    return source_ids
+
+
+def _render_source_uris(answer: str, source_uri_map: Mapping[str, str]) -> str:
+    """Render verified source IDs with backend-owned OpenViking URIs."""
+    _validate_source_markers(answer, source_uri_map)
+    return _SOURCE_MARKER_PATTERN.sub(
+        lambda match: f"【知识来源：{source_uri_map[match.group(1)]}】",
+        answer,
+    )
 
 
 def _is_user_message(message: Any) -> bool:
@@ -374,7 +445,7 @@ class AgentLoop:
             }
         )
 
-    def _with_node_progress(self, node_name: str, handler: NodeHandler) -> NodeHandler:
+    def _with_node_progress(self, node_name: str, handler: NodeHandler) -> Any:
         """Wrap every graph node with start/completion progress notifications."""
 
         async def wrapped(state: GraphState) -> dict[str, Any]:
@@ -1128,6 +1199,7 @@ class AgentLoop:
                 ),
             }
 
+        llm_evidence, _ = _build_llm_evidence(state.selected_evidence)
         assessment = await self.llm_service.call(
             [
                 SystemMessage(content=get_agentic_rag_prompt("evidence_grader")),
@@ -1142,7 +1214,7 @@ class AgentLoop:
                                 "role_evidence": state.role_evidence,
                             },
                             "answer_requirements": [item.model_dump() for item in requirements],
-                            "evidence": state.selected_evidence,
+                            "evidence": llm_evidence,
                         },
                         max_chars=MAX_EVIDENCE_CHARS,
                     )
@@ -1302,6 +1374,7 @@ class AgentLoop:
     async def answer_generator(self, state: GraphState) -> dict[str, Any]:
         """Generate or revise a cited answer using selected evidence only."""
         requirements = _parse_answer_requirements(state.answer_requirements)
+        llm_evidence, _ = _build_llm_evidence(state.selected_evidence)
         response = await self.llm_service.call(
             [
                 SystemMessage(content=get_agentic_rag_prompt("answer_generator")),
@@ -1312,7 +1385,7 @@ class AgentLoop:
                             "role": state.user_role,
                             "answer_requirements": [item.model_dump() for item in requirements],
                             "missing_optional_ids": state.missing_optional_ids,
-                            "evidence": state.selected_evidence,
+                            "evidence": llm_evidence,
                             "revision_instructions": state.revision_instructions,
                         },
                         max_chars=MAX_EVIDENCE_CHARS,
@@ -1324,11 +1397,25 @@ class AgentLoop:
         return {"draft_answer": answer, "route": "groundedness_verifier"}
 
     async def groundedness_verifier(self, state: GraphState) -> dict[str, Any]:
-        """Verify support, coverage, and citation validity."""
+        """Verify evidence support and required-answer coverage."""
         requirements = _parse_answer_requirements(state.answer_requirements)
         required_id_set = {item.requirement_id for item in requirements if item.priority == "required"}
         optional_id_set = {item.requirement_id for item in requirements if item.priority == "optional"}
-        available_uris = sorted({item["uri"] for item in state.selected_evidence if item.get("uri")})
+        llm_evidence, source_uri_map = _build_llm_evidence(state.selected_evidence)
+        try:
+            _validate_source_markers(state.draft_answer, source_uri_map)
+        except ValueError as exc:
+            logger.warning(
+                "answer_source_marker_validation_failed",
+                error=str(exc),
+                revision_count=state.revision_count,
+            )
+            retry_allowed = state.revision_count < 1
+            return {
+                "revision_instructions": str(exc),
+                "revision_count": state.revision_count + (1 if retry_allowed else 0),
+                "route": "answer_generator" if retry_allowed else "knowledge_not_found",
+            }
         assessment = await self.llm_service.call(
             [
                 SystemMessage(content=get_agentic_rag_prompt("groundedness_verifier")),
@@ -1342,8 +1429,7 @@ class AgentLoop:
                             },
                             "answer_requirements": [item.model_dump() for item in requirements],
                             "draft_answer": state.draft_answer,
-                            "available_uris": available_uris,
-                            "evidence": state.selected_evidence,
+                            "evidence": llm_evidence,
                         },
                         max_chars=MAX_EVIDENCE_CHARS,
                     )
@@ -1352,11 +1438,10 @@ class AgentLoop:
             response_format=GroundednessAssessment,
         )
 
-        has_valid_citation = not available_uris or any(uri in state.draft_answer for uri in available_uris)
         missing_required_ids = [item for item in assessment.missing_required_ids if item in required_id_set]
         missing_optional_ids = [item for item in assessment.missing_optional_ids if item in optional_id_set]
         has_required_gap = bool(missing_required_ids)
-        if assessment.passed and assessment.action == "pass" and has_valid_citation and not has_required_gap:
+        if assessment.passed and assessment.action == "pass" and not has_required_gap:
             route = "finalizer"
         elif has_required_gap and assessment.action == "retrieve":
             route = _next_retrieval_route(state.retrieval_stage, state.hitl_retry_used)
@@ -1368,8 +1453,6 @@ class AgentLoop:
             route = "knowledge_not_found" if state.hitl_retry_used else "question_clarification"
 
         instructions = assessment.revision_instructions
-        if not has_valid_citation:
-            instructions = f"{instructions}\n为关键结论补充可用 URI 引用。".strip()
         return {
             "missing_required_ids": missing_required_ids or state.missing_required_ids,
             "missing_optional_ids": missing_optional_ids or state.missing_optional_ids,
@@ -1379,9 +1462,10 @@ class AgentLoop:
         }
 
     async def finalizer(self, state: GraphState) -> dict[str, Any]:
-        """Generate and publish the verified final answer as model token chunks."""
+        """Buffer the model response, then publish backend-rendered source URIs."""
         writer = get_stream_writer()
-        chunks: list[str] = []
+        llm_evidence, source_uri_map = _build_llm_evidence(state.selected_evidence)
+        model_chunks: list[str] = []
         async for chunk in self.llm_service.stream(
             [
                 SystemMessage(content=get_agentic_rag_prompt("final_answer_generator")),
@@ -1391,19 +1475,22 @@ class AgentLoop:
                             "query": state.normalized_query,
                             "role": state.user_role,
                             "verified_draft": state.draft_answer,
-                            "evidence": state.selected_evidence,
+                            "evidence": llm_evidence,
                         },
                         max_chars=MAX_EVIDENCE_CHARS,
                     )
                 ),
             ]
         ):
-            chunks.append(chunk)
-            writer({"type": "final_answer_chunk", "content": chunk})
-        final_answer = "".join(chunks).strip()
-        if not final_answer:
-            final_answer = state.draft_answer
-            writer({"type": "final_answer_chunk", "content": final_answer})
+            model_chunks.append(chunk)
+        model_answer = "".join(model_chunks).strip() or state.draft_answer
+        try:
+            final_answer = _render_source_uris(model_answer, source_uri_map)
+        except ValueError:
+            logger.warning("final_answer_source_marker_invalid_using_verified_draft")
+            final_answer = _render_source_uris(state.draft_answer, source_uri_map)
+        for index in range(0, len(final_answer), 256):
+            writer({"type": "final_answer_chunk", "content": final_answer[index : index + 256]})
         return {
             "final_answer": final_answer,
             "messages": [AIMessage(content=final_answer)],

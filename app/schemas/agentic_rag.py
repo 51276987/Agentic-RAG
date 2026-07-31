@@ -153,7 +153,7 @@ class EvidenceAssessment(BaseModel):
 
 
 class GroundednessAssessment(BaseModel):
-    """Groundedness and citation verification output."""
+    """Groundedness and required-answer coverage verification output."""
 
     passed: bool
     action: Literal["pass", "revise", "retrieve"]
